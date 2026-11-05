@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings -D clippy::all
+      - run: cargo test
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
