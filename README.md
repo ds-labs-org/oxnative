@@ -104,9 +104,39 @@ How each part of the contract maps onto fjall:
   The merge of the bulk files happens at that point, in one thread, whereas
   RocksDB only links the files it is given.
 - All commits go through one lock.
+- On-disk size, for 500,000 triples (28 MB of N-Triples): about 34 MB after a
+  bulk load, against 28 MB with RocksDB. fjall's journal file is preallocated to
+  64 MiB, so tools reporting apparent sizes (`ls -l`, `du --apparent-size`)
+  show about 64 MB more than is allocated (`du`). Data blocks are LZ4-compressed
+  at every level (see `keyspace_options`); this only applies to databases
+  created with this setting, since fjall stores the options with each keyspace.
 - Commits are written to the OS but not synced until `Db::flush`, like
   RocksDB's default write-ahead log settings; fjall also syncs when the database
   is dropped.
+
+## Open fjall issues that affect this backend
+
+Checked on 2026-11-05 against fjall 3.1.13 / lsm-tree 3.1.10.
+
+- [fjall#333](https://github.com/fjall-rs/fjall/issues/333): a snapshot opened
+  while a batch is being committed can see part of it, if a flush, compaction
+  or ingestion finishes at that moment. This breaks the atomicity of
+  `Transaction::commit` for concurrent readers.
+- [fjall#288](https://github.com/fjall-rs/fjall/issues/288), fix proposed in
+  [fjall#325](https://github.com/fjall-rs/fjall/pull/325): a keyspace whose
+  memtables are empty and whose tables were dropped (for example all its keys
+  removed, then `compact`) pins the oldest journal, and the journal then grows
+  without bound. Oxigraph's `optimize` compacts every column family, so a store
+  whose named graphs are all removed, then optimized, can hit it.
+- [fjall#344](https://github.com/fjall-rs/fjall/issues/344): the write buffer
+  size limit is not enforced, so memtables and the journal can grow well past
+  64 MiB during sustained writes (bulk loads use ingestion and are not
+  affected).
+- [fjall#313](https://github.com/fjall-rs/fjall/issues/313) (read-only mode)
+  and [fjall#52](https://github.com/fjall-rs/fjall/issues/52) /
+  [fjall#314](https://github.com/fjall-rs/fjall/issues/314) (checkpoints): once
+  available, they would replace the private copy behind `open_read_only` and the
+  logical `backup`.
 
 ## How it plugs into Oxigraph
 

@@ -8,7 +8,8 @@ mod sst;
 use crate::copy::PrivateCopy;
 pub use crate::error::KvError;
 use crate::overlay::{Cursor, Overlay};
-use fjall::{KeyspaceCreateOptions, PersistMode, Readable, Slice};
+use fjall::config::CompressionPolicy;
+use fjall::{CompressionType, KeyspaceCreateOptions, PersistMode, Readable, Slice};
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fs;
@@ -320,7 +321,7 @@ impl DbInner {
             if !writable && !db.keyspace_exists(name) {
                 return Err(KvError::MissingColumnFamily(name));
             }
-            let keyspace = db.keyspace(name, KeyspaceCreateOptions::default)?;
+            let keyspace = db.keyspace(name, keyspace_options)?;
             column_families.push((name, ColumnFamily { index, keyspace }));
         }
         let meta = db.keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)?;
@@ -483,7 +484,7 @@ impl DbInner {
         let target_db = fjall::Database::builder(target.join(FJALL_DIR)).open()?;
         let snapshot = self.snapshot();
         for (name, cf) in &self.column_families {
-            let keyspace = target_db.keyspace(name, KeyspaceCreateOptions::default)?;
+            let keyspace = target_db.keyspace(name, keyspace_options)?;
             let mut ingestion = keyspace.start_ingestion()?;
             for guard in snapshot.iter(&cf.keyspace) {
                 let (key, value) = guard.into_inner()?;
@@ -494,6 +495,18 @@ impl DbInner {
         target_db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
+}
+
+/// Options of the keyspaces backing column families. fjall stores them when a
+/// keyspace is created, so they only apply to new databases.
+///
+/// fjall compresses data blocks only from level 2 down, but bulk loads land at
+/// level 1 and stay there until compacted: with that default a freshly loaded
+/// database is about twice as large. Like Oxigraph's RocksDB settings, all
+/// levels use LZ4 (no measurable read or write slowdown in our measurements).
+fn keyspace_options() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default()
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
 }
 
 /// Creates the database directory, or checks that an existing one belongs to
