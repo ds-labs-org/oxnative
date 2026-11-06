@@ -1,241 +1,701 @@
 #![cfg_attr(doc, doc = include_str!("../README.md"))]
-//!
-//! Every handle type holds a value of the uninhabited private `Never` type, so none
-//! of them can exist until a real engine replaces it. That keeps the placeholder
-//! free of `unimplemented!()`: the only reachable code paths are the two `open`
-//! functions, which return [`KvError::Unimplemented`].
 
+mod copy;
+mod error;
+mod overlay;
+mod sst;
+
+use crate::copy::PrivateCopy;
+pub use crate::error::KvError;
+use crate::overlay::{Cursor, Overlay};
+use fjall::config::CompressionPolicy;
+use fjall::{CompressionType, KeyspaceCreateOptions, PersistMode, Readable, Slice};
 use std::borrow::Borrow;
-use std::error::Error as StdError;
-use std::marker::PhantomData;
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, Write as _};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::{fmt, io};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Placeholder for the engine state. Uninhabited: replace it with real handles.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Never {}
+/// File identifying an oxnative database directory.
+const MARKER_FILE: &str = "OXNATIVE";
+const MARKER_CONTENT: &str = "oxnative 1\nengine fjall 3\n";
+/// Subdirectory holding the fjall database.
+const FJALL_DIR: &str = "fjall";
+/// Subdirectory holding bulk-load files until they are ingested.
+const BULK_DIR: &str = "bulk";
+/// Internal keyspace, never exposed as a column family.
+const META_KEYSPACE: &str = "_oxnative_meta";
+/// Column family that always exists, as in RocksDB.
+const DEFAULT_COLUMN_FAMILY: &str = "default";
+/// Key of the in-progress bulk load record in [`META_KEYSPACE`].
+const BULK_LOAD_KEY: &[u8] = b"bulk_load";
 
 /// Definition of a column family, given when opening the database.
 ///
-/// The set of column families is fixed for the lifetime of a [`Db`].
+/// The set of column families is fixed for the lifetime of a [`Db`]. As in
+/// RocksDB, a `default` column family always exists, even if not listed.
 pub struct ColumnFamilyDefinition {
     /// Name of the column family.
     pub name: &'static str,
-    /// Whether the column family is iterated over (RocksDB uses this to tune
-    /// its memtable and block cache; an engine may ignore it).
+    /// Whether the column family is iterated over. Not used by this engine.
     pub use_iter: bool,
-    /// Length of the key prefix used by prefix scans (RocksDB builds a prefix
-    /// bloom filter of this length; an engine may ignore it).
+    /// Length of the key prefix used by prefix scans. Not used by this engine.
     pub min_prefix_size: usize,
-    /// Whether writes to this column family may be reordered (an engine may
-    /// ignore it).
+    /// Whether writes to this column family may be reordered. Not used by this
+    /// engine.
     pub unordered_writes: bool,
 }
 
 /// Options for [`Db::open_read_write`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DbOptions {
-    /// Maximum number of files the engine may keep open.
+    /// Maximum number of table files kept open.
     pub max_open_files: Option<i32>,
-    /// Number of file descriptors to leave to the rest of the process.
+    /// Number of file descriptors to leave to the rest of the process. Not
+    /// used by this engine.
     pub fd_reserve: Option<u32>,
 }
 
 /// A database handle. Cheap to clone, `Send + Sync`.
 #[derive(Clone)]
 pub struct Db {
-    never: Never,
+    inner: Arc<DbInner>,
+}
+
+struct DbInner {
+    db: fjall::Database,
+    meta: fjall::Keyspace,
+    column_families: Vec<(&'static str, ColumnFamily)>,
+    root: PathBuf,
+    writable: bool,
+    /// Serializes writes, so that `remove_range` and bulk loads see a stable
+    /// committed state.
+    commit_lock: Mutex<()>,
+    /// Taken for reading to create snapshots and read the latest state, and for
+    /// writing by bulk loads, so that a reader sees all or none of the column
+    /// families of a bulk load.
+    visibility: RwLock<()>,
+    /// Private copy opened by read-only handles; dropped after `db`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "only kept for its Drop"))]
+    copy: Option<PrivateCopy>,
 }
 
 impl Db {
     /// Opens or creates the database at `path` in read-write mode.
     ///
     /// Column families listed in `column_families` that do not exist yet are
-    /// created.
+    /// created. Only one read-write handle may be open on a directory at a time.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "same signature as Oxigraph's RocksDB wrapper"
+    )]
     pub fn open_read_write(
-        _path: &Path,
-        _column_families: Vec<ColumnFamilyDefinition>,
-        _db_options: DbOptions,
+        path: &Path,
+        column_families: Vec<ColumnFamilyDefinition>,
+        db_options: DbOptions,
     ) -> Result<Self, KvError> {
-        Err(KvError::Unimplemented)
+        prepare_root(path)?;
+        let mut builder = fjall::Database::builder(path.join(FJALL_DIR));
+        if let Some(max_open_files) = db_options
+            .max_open_files
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0)
+        {
+            builder = builder.max_cached_files(Some(max_open_files));
+        }
+        let db = builder.open()?;
+        let inner = DbInner::new(db, &column_families, path, true, None)?;
+        inner.recover_bulk_load()?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     /// Opens an existing database at `path` in read-only mode.
     ///
-    /// Writes, transactions, bulk loads, flush and compaction must fail on a
-    /// read-only handle.
+    /// The handle sees the database as it was when opened: it reads a private
+    /// copy (table files are hard-linked when possible), so it can coexist with
+    /// a read-write handle on the same directory. Opening while another
+    /// process writes to the database is not supported.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "same signature as Oxigraph's RocksDB wrapper"
+    )]
     pub fn open_read_only(
-        _path: &Path,
-        _column_families: Vec<ColumnFamilyDefinition>,
+        path: &Path,
+        column_families: Vec<ColumnFamilyDefinition>,
     ) -> Result<Self, KvError> {
-        Err(KvError::Unimplemented)
+        check_marker(path)?;
+        let source = path.join(FJALL_DIR);
+        if !source.is_dir() {
+            return Err(KvError::corruption(format!(
+                "{} has no {FJALL_DIR} directory",
+                path.display()
+            )));
+        }
+        let copy = PrivateCopy::create(&source, path)?;
+        let db = fjall::Database::builder(copy.path()).open()?;
+        let inner = DbInner::new(db, &column_families, path, false, Some(copy))?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     /// Whether this handle was opened with [`Db::open_read_write`].
     pub fn is_writable(&self) -> bool {
-        match self.never {}
+        self.inner.writable
     }
 
     /// Returns the handle of a column family given at open time.
-    ///
-    /// Must fail with [`KvError::MissingColumnFamily`] if the column family
-    /// does not exist.
-    pub fn column_family(&self, _name: &'static str) -> Result<ColumnFamily, KvError> {
-        match self.never {}
+    pub fn column_family(&self, name: &'static str) -> Result<ColumnFamily, KvError> {
+        self.inner
+            .column_families
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, cf)| cf.clone())
+            .ok_or(KvError::MissingColumnFamily(name))
     }
 
     /// Returns a point-in-time view of the database.
-    ///
-    /// Later writes must not be visible through it. It may outlive this `Db`
-    /// handle (but not the last clone of it).
     #[must_use]
     pub fn snapshot(&self) -> Reader<'static> {
-        match self.never {}
+        Reader {
+            kind: ReaderKind::Snapshot {
+                snapshot: self.inner.snapshot(),
+                db: Arc::clone(&self.inner),
+            },
+        }
     }
 
     /// Starts a write-only batch, applied atomically by [`Transaction::commit`].
     pub fn start_transaction(&self) -> Result<Transaction, KvError> {
-        match self.never {}
+        self.inner.check_writable("Transaction")?;
+        Ok(Transaction {
+            db: Arc::clone(&self.inner),
+            overlay: Overlay::default(),
+        })
     }
 
     /// Starts a transaction that reads a snapshot taken now plus its own
     /// pending writes, applied atomically by [`ReadableTransaction::commit`].
     pub fn start_readable_transaction(&self) -> Result<ReadableTransaction<'_>, KvError> {
-        match self.never {}
+        self.inner.check_writable("Transaction")?;
+        Ok(ReadableTransaction {
+            db: &self.inner,
+            snapshot: self.inner.snapshot(),
+            overlay: Overlay::default(),
+        })
     }
 
     /// Reads the latest committed value of `key`.
     pub fn get(
         &self,
-        _column_family: &ColumnFamily,
-        _key: &[u8],
+        column_family: &ColumnFamily,
+        key: &[u8],
     ) -> Result<Option<PinnableSlice>, KvError> {
-        match self.never {}
+        let _visibility = self.inner.read_visibility();
+        Ok(column_family.keyspace.get(key)?.map(PinnableSlice))
     }
 
     /// Whether `key` exists in the latest committed state.
-    pub fn contains_key(
-        &self,
-        _column_family: &ColumnFamily,
-        _key: &[u8],
-    ) -> Result<bool, KvError> {
-        match self.never {}
+    pub fn contains_key(&self, column_family: &ColumnFamily, key: &[u8]) -> Result<bool, KvError> {
+        let _visibility = self.inner.read_visibility();
+        Ok(column_family.keyspace.contains_key(key)?)
     }
 
     /// Writes a single key outside of any batch.
     pub fn insert(
         &self,
-        _column_family: &ColumnFamily,
-        _key: &[u8],
-        _value: &[u8],
+        column_family: &ColumnFamily,
+        key: &[u8],
+        value: &[u8],
     ) -> Result<(), KvError> {
-        match self.never {}
+        self.inner.check_writable("Insert")?;
+        let _commit = self.inner.lock_commit()?;
+        Ok(column_family.keyspace.insert(key, value)?)
     }
 
-    /// Persists all pending writes to disk.
+    /// Persists all committed writes to disk.
     pub fn flush(&self) -> Result<(), KvError> {
-        match self.never {}
+        self.inner.check_writable("Flush")?;
+        Ok(self.inner.db.persist(PersistMode::SyncAll)?)
     }
 
-    /// Compacts a column family. May be a no-op.
-    pub fn compact(&self, _column_family: &ColumnFamily) -> Result<(), KvError> {
-        match self.never {}
+    /// Compacts a column family into as few tables as possible.
+    pub fn compact(&self, column_family: &ColumnFamily) -> Result<(), KvError> {
+        self.inner.check_writable("Compaction")?;
+        Ok(column_family.keyspace.major_compact()?)
     }
 
     /// Creates a writer for a sorted file, written outside the database and
-    /// added later with [`Db::insert_stt_files`]. Keys are inserted in
+    /// added later with [`Db::insert_stt_files`]. Keys are inserted in strictly
     /// increasing order.
     pub fn new_sst_file(&self) -> Result<SstFileWriter, KvError> {
-        match self.never {}
+        self.inner.check_writable("Bulk-load file creation")?;
+        let path = self
+            .inner
+            .root
+            .join(BULK_DIR)
+            .join(format!("{}.sst", unique_suffix()));
+        Ok(SstFileWriter(sst::Writer::create(path)?))
     }
 
     /// Atomically adds files produced by [`SstFileWriter::finish`] to the
-    /// given column families. An empty list is a no-op.
-    pub fn insert_stt_files(
-        &self,
-        _ssts_for_cf: &[(ColumnFamily, PathBuf)],
-    ) -> Result<(), KvError> {
-        match self.never {}
+    /// given column families. An empty list is a no-op. The files are left in
+    /// place; the caller deletes them.
+    ///
+    /// Readers see either none or all of the files. If the process stops in
+    /// the middle, the load is completed when the database is next opened in
+    /// read-write mode.
+    pub fn insert_stt_files(&self, ssts_for_cf: &[(ColumnFamily, PathBuf)]) -> Result<(), KvError> {
+        self.inner.check_writable("Bulk-load file ingestion")?;
+        if ssts_for_cf.is_empty() {
+            return Ok(());
+        }
+        let mut by_cf = BTreeMap::<usize, (&ColumnFamily, Vec<PathBuf>)>::new();
+        for (cf, path) in ssts_for_cf {
+            by_cf
+                .entry(cf.index)
+                .or_insert_with(|| (cf, Vec::new()))
+                .1
+                .push(path.clone());
+        }
+        let _commit = self.inner.lock_commit()?;
+        self.inner.write_bulk_load_record(by_cf.values())?;
+        {
+            let _visibility = self
+                .inner
+                .visibility
+                .write()
+                .map_err(|_| KvError::poisoned())?;
+            for (cf, paths) in by_cf.values() {
+                sst::ingest(&cf.keyspace, paths)?;
+            }
+        }
+        self.inner.clear_bulk_load_record()
     }
 
     /// Writes a consistent copy of the database into `target_directory`, which
-    /// must not exist yet. The copy must be openable with
-    /// [`Db::open_read_write`] and [`Db::open_read_only`].
-    pub fn backup(&self, _target_directory: &Path) -> Result<(), KvError> {
-        match self.never {}
+    /// must not exist yet. The copy can be opened with [`Db::open_read_write`]
+    /// and [`Db::open_read_only`].
+    ///
+    /// The copy is logical (every key is rewritten), so it takes time and space
+    /// proportional to the database size.
+    pub fn backup(&self, target_directory: &Path) -> Result<(), KvError> {
+        #[expect(clippy::create_dir, reason = "the target must not exist yet")]
+        fs::create_dir(target_directory)?;
+        let result = self.inner.backup_into(target_directory);
+        if result.is_err() {
+            // Best effort: do not leave a half-written backup behind
+            #[expect(unused_must_use, reason = "the backup error is the one to report")]
+            fs::remove_dir_all(target_directory);
+        }
+        result
     }
+}
+
+impl DbInner {
+    fn new(
+        db: fjall::Database,
+        definitions: &[ColumnFamilyDefinition],
+        root: &Path,
+        writable: bool,
+        copy: Option<PrivateCopy>,
+    ) -> Result<Self, KvError> {
+        // Like RocksDB, there is always a "default" column family
+        let mut names = definitions.iter().map(|d| d.name).collect::<Vec<_>>();
+        if !names.contains(&DEFAULT_COLUMN_FAMILY) {
+            names.push(DEFAULT_COLUMN_FAMILY);
+        }
+        let mut column_families = Vec::with_capacity(names.len());
+        for (index, name) in names.into_iter().enumerate() {
+            if name.is_empty() || name.len() > usize::from(u8::MAX) || name == META_KEYSPACE {
+                return Err(KvError::other(format!(
+                    "invalid column family name {name:?}"
+                )));
+            }
+            if !writable && !db.keyspace_exists(name) {
+                return Err(KvError::MissingColumnFamily(name));
+            }
+            let keyspace = db.keyspace(name, keyspace_options)?;
+            column_families.push((name, ColumnFamily { index, keyspace }));
+        }
+        let meta = db.keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)?;
+        Ok(Self {
+            db,
+            meta,
+            column_families,
+            root: root.to_path_buf(),
+            writable,
+            commit_lock: Mutex::new(()),
+            visibility: RwLock::new(()),
+            copy,
+        })
+    }
+
+    fn check_writable(&self, operation: &str) -> Result<(), KvError> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(KvError::read_only(operation))
+        }
+    }
+
+    fn lock_commit(&self) -> Result<MutexGuard<'_, ()>, KvError> {
+        self.commit_lock.lock().map_err(|_| KvError::poisoned())
+    }
+
+    fn read_visibility(&self) -> RwLockReadGuard<'_, ()> {
+        // The guarded value is `()`: a poisoned lock protects nothing broken
+        self.visibility
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn snapshot(&self) -> fjall::Snapshot {
+        let _visibility = self.read_visibility();
+        self.db.snapshot()
+    }
+
+    fn column_family_at(&self, index: usize) -> Result<&ColumnFamily, KvError> {
+        self.column_families
+            .get(index)
+            .map(|(_, cf)| cf)
+            .ok_or_else(|| KvError::other("column family from another database"))
+    }
+
+    fn column_family_named(&self, name: &str) -> Result<&ColumnFamily, KvError> {
+        self.column_families
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, cf)| cf)
+            .ok_or_else(|| {
+                KvError::corruption(format!("unknown column family {name} in bulk-load record"))
+            })
+    }
+
+    fn commit(&self, overlay: &Overlay) -> Result<(), KvError> {
+        let _commit = self.lock_commit()?;
+        let mut batch = self.db.batch();
+        for &index in overlay.cleared.keys() {
+            let cf = self.column_family_at(index)?;
+            for key in overlay.keys_to_clear(index, &cf.keyspace)? {
+                batch.remove(&cf.keyspace, key);
+            }
+        }
+        for (&index, writes) in &overlay.writes {
+            let cf = self.column_family_at(index)?;
+            for (key, value) in writes {
+                match value {
+                    Some(value) => batch.insert(&cf.keyspace, key.as_slice(), value.as_slice()),
+                    None => batch.remove(&cf.keyspace, key.as_slice()),
+                }
+            }
+        }
+        Ok(batch.commit()?)
+    }
+
+    /// Records the files of a bulk load durably before ingesting them, so that
+    /// an interrupted load can be completed on the next open.
+    fn write_bulk_load_record<'a>(
+        &self,
+        files: impl Iterator<Item = &'a (&'a ColumnFamily, Vec<PathBuf>)>,
+    ) -> Result<(), KvError> {
+        let mut record = String::new();
+        for (cf, paths) in files {
+            let name = self
+                .column_families
+                .get(cf.index)
+                .map(|(n, _)| *n)
+                .ok_or_else(|| KvError::other("column family from another database"))?;
+            for path in paths {
+                let path = path.to_str().ok_or_else(|| {
+                    KvError::other(format!(
+                        "bulk-load file path {} is not valid UTF-8",
+                        path.display()
+                    ))
+                })?;
+                if path.contains(['\t', '\n']) {
+                    return Err(KvError::other(format!(
+                        "bulk-load file path {path:?} contains a tab or a newline"
+                    )));
+                }
+                record.push_str(name);
+                record.push('\t');
+                record.push_str(path);
+                record.push('\n');
+            }
+        }
+        self.meta.insert(BULK_LOAD_KEY, record.as_bytes())?;
+        self.db.persist(PersistMode::SyncAll)?;
+        Ok(())
+    }
+
+    fn clear_bulk_load_record(&self) -> Result<(), KvError> {
+        self.meta.remove(BULK_LOAD_KEY)?;
+        // Durable before the caller deletes the files the record points to
+        self.db.persist(PersistMode::SyncAll)?;
+        Ok(())
+    }
+
+    /// Completes a bulk load interrupted by a crash.
+    fn recover_bulk_load(&self) -> Result<(), KvError> {
+        let Some(record) = self.meta.get(BULK_LOAD_KEY)? else {
+            return Ok(());
+        };
+        let record = std::str::from_utf8(&record)
+            .map_err(|_| KvError::corruption("bulk-load record is not valid UTF-8"))?;
+        let mut by_cf = BTreeMap::<usize, (&ColumnFamily, Vec<PathBuf>)>::new();
+        for line in record.lines() {
+            let (name, path) = line
+                .split_once('\t')
+                .ok_or_else(|| KvError::corruption("invalid bulk-load record"))?;
+            let cf = self.column_family_named(name)?;
+            by_cf
+                .entry(cf.index)
+                .or_insert_with(|| (cf, Vec::new()))
+                .1
+                .push(PathBuf::from(path));
+        }
+        // Re-ingesting a column family that was already ingested is harmless:
+        // the files hold the same keys and values.
+        for (cf, paths) in by_cf.values() {
+            sst::ingest(&cf.keyspace, paths)?;
+        }
+        self.clear_bulk_load_record()?;
+        for (_, paths) in by_cf.values() {
+            for path in paths {
+                // The loader that created them is gone
+                #[expect(unused_must_use, reason = "a leftover file only wastes space")]
+                fs::remove_file(path);
+            }
+        }
+        Ok(())
+    }
+
+    fn backup_into(&self, target: &Path) -> Result<(), KvError> {
+        write_marker(target)?;
+        #[expect(clippy::create_dir, reason = "the target was just created")]
+        fs::create_dir(target.join(BULK_DIR))?;
+        let target_db = fjall::Database::builder(target.join(FJALL_DIR)).open()?;
+        let snapshot = self.snapshot();
+        for (name, cf) in &self.column_families {
+            let keyspace = target_db.keyspace(name, keyspace_options)?;
+            let mut ingestion = keyspace.start_ingestion()?;
+            for guard in snapshot.iter(&cf.keyspace) {
+                let (key, value) = guard.into_inner()?;
+                ingestion.write(key, value)?;
+            }
+            ingestion.finish()?;
+        }
+        target_db.persist(PersistMode::SyncAll)?;
+        Ok(())
+    }
+}
+
+/// Options of the keyspaces backing column families. fjall stores them when a
+/// keyspace is created, so they only apply to new databases.
+///
+/// fjall compresses data blocks only from level 2 down, but bulk loads land at
+/// level 1 and stay there until compacted: with that default a freshly loaded
+/// database is about twice as large. Like Oxigraph's RocksDB settings, all
+/// levels use LZ4 (no measurable read or write slowdown in our measurements).
+fn keyspace_options() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default()
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
+}
+
+/// Creates the database directory, or checks that an existing one belongs to
+/// this engine.
+fn prepare_root(path: &Path) -> Result<(), KvError> {
+    if path.join(MARKER_FILE).exists() {
+        check_marker(path)?;
+    } else if !path.exists() {
+        fs::create_dir_all(path)?;
+        write_marker(path)?;
+    } else if fs::read_dir(path)?.next().is_none() {
+        write_marker(path)?;
+    } else {
+        return Err(KvError::corruption(format!(
+            "{} is not an oxnative database (no {MARKER_FILE} file). Databases written by \
+             the RocksDB backend must be migrated with a dump and a load.",
+            path.display()
+        )));
+    }
+    fs::create_dir_all(path.join(BULK_DIR))?;
+    Ok(())
+}
+
+fn check_marker(path: &Path) -> Result<(), KvError> {
+    let content = fs::read_to_string(path.join(MARKER_FILE)).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            KvError::corruption(format!(
+                "{} is not an oxnative database (no {MARKER_FILE} file)",
+                path.display()
+            ))
+        } else {
+            e.into()
+        }
+    })?;
+    if content.lines().next() == MARKER_CONTENT.lines().next() {
+        Ok(())
+    } else {
+        Err(KvError::corruption(format!(
+            "unsupported oxnative database format in {}: {:?}",
+            path.display(),
+            content.lines().next().unwrap_or_default()
+        )))
+    }
+}
+
+fn write_marker(path: &Path) -> Result<(), KvError> {
+    let mut file = fs::File::create_new(path.join(MARKER_FILE))?;
+    file.write_all(MARKER_CONTENT.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn unique_suffix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Handle to a column family. Cheap to clone, `Send + Sync`, usable as a map key.
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct ColumnFamily {
-    never: Never,
+    index: usize,
+    keyspace: fjall::Keyspace,
 }
 
 /// A read view: a snapshot ([`Db::snapshot`]) or a transaction's own view
 /// ([`ReadableTransaction::reader`]). Cheap to clone, `Send + Sync`.
 #[derive(Clone)]
 pub struct Reader<'a> {
-    never: Never,
-    /// Stand-in for the engine's shared state (a real reader keeps the
-    /// database alive).
-    _db: Arc<()>,
-    _lifetime: PhantomData<&'a ()>,
+    kind: ReaderKind<'a>,
+}
+
+#[derive(Clone)]
+enum ReaderKind<'a> {
+    Snapshot {
+        snapshot: fjall::Snapshot,
+        /// Keeps a read-only handle's private copy alive.
+        db: Arc<DbInner>,
+    },
+    Transaction {
+        snapshot: &'a fjall::Snapshot,
+        overlay: &'a Overlay,
+    },
 }
 
 impl<'a> Reader<'a> {
     /// Reads `key` in this view.
     pub fn get(
         &self,
-        _column_family: &ColumnFamily,
-        _key: &[u8],
+        column_family: &ColumnFamily,
+        key: &[u8],
     ) -> Result<Option<PinnableSlice>, KvError> {
-        match self.never {}
+        match &self.kind {
+            ReaderKind::Snapshot { snapshot, .. } => Ok(snapshot
+                .get(&column_family.keyspace, key)?
+                .map(PinnableSlice)),
+            ReaderKind::Transaction { snapshot, overlay } => {
+                match overlay.get(column_family.index, key) {
+                    Some(Some(value)) => Ok(Some(PinnableSlice(Slice::from(value.as_slice())))),
+                    Some(None) => Ok(None),
+                    None => Ok(snapshot
+                        .get(&column_family.keyspace, key)?
+                        .map(PinnableSlice)),
+                }
+            }
+        }
     }
 
     /// Whether `key` exists in this view.
-    pub fn contains_key(
-        &self,
-        _column_family: &ColumnFamily,
-        _key: &[u8],
-    ) -> Result<bool, KvError> {
-        match self.never {}
+    pub fn contains_key(&self, column_family: &ColumnFamily, key: &[u8]) -> Result<bool, KvError> {
+        match &self.kind {
+            ReaderKind::Snapshot { snapshot, .. } => {
+                Ok(snapshot.contains_key(&column_family.keyspace, key)?)
+            }
+            ReaderKind::Transaction { snapshot, overlay } => {
+                match overlay.get(column_family.index, key) {
+                    Some(value) => Ok(value.is_some()),
+                    None => Ok(snapshot.contains_key(&column_family.keyspace, key)?),
+                }
+            }
+        }
     }
 
     /// Iterates over all keys of a column family, in increasing byte order.
     #[expect(clippy::iter_not_returning_iterator)]
-    pub fn iter(&self, _column_family: &ColumnFamily) -> Iter<'a> {
-        match self.never {}
+    pub fn iter(&self, column_family: &ColumnFamily) -> Iter<'a> {
+        self.scan_prefix(column_family, &[])
     }
 
     /// Iterates over the keys starting with `prefix`, in increasing byte order.
-    pub fn scan_prefix(&self, _column_family: &ColumnFamily, _prefix: &[u8]) -> Iter<'a> {
-        match self.never {}
+    pub fn scan_prefix(&self, column_family: &ColumnFamily, prefix: &[u8]) -> Iter<'a> {
+        match &self.kind {
+            ReaderKind::Snapshot { snapshot, db } => Iter {
+                cursor: Box::new(Cursor::new(
+                    snapshot.prefix(&column_family.keyspace, prefix),
+                    None,
+                )),
+                _db: Some(Arc::clone(db)),
+            },
+            ReaderKind::Transaction { snapshot, overlay } => {
+                let pending: &'a Overlay = overlay;
+                Iter {
+                    cursor: Box::new(Cursor::new(
+                        snapshot.prefix(&column_family.keyspace, prefix),
+                        pending.scan_prefix(column_family.index, prefix),
+                    )),
+                    _db: None,
+                }
+            }
+        }
     }
 
     /// Number of keys in a column family.
-    pub fn len(&self, _column_family: &ColumnFamily) -> Result<usize, KvError> {
-        match self.never {}
+    pub fn len(&self, column_family: &ColumnFamily) -> Result<usize, KvError> {
+        let mut count = 0;
+        let mut iter = self.iter(column_family);
+        while iter.is_valid() {
+            count += 1;
+            iter.next();
+        }
+        iter.status()?;
+        Ok(count)
     }
 
     /// Whether a column family has no keys.
-    pub fn is_empty(&self, _column_family: &ColumnFamily) -> Result<bool, KvError> {
-        match self.never {}
+    pub fn is_empty(&self, column_family: &ColumnFamily) -> Result<bool, KvError> {
+        let iter = self.iter(column_family);
+        iter.status()?;
+        Ok(!iter.is_valid())
     }
 }
 
 /// Write-only batch. Nothing is visible until [`Transaction::commit`]; dropping
 /// it discards the writes.
 pub struct Transaction {
-    never: Never,
+    db: Arc<DbInner>,
+    overlay: Overlay,
 }
 
 impl Transaction {
     /// Sets `key` to `value`.
-    pub fn insert(&mut self, _column_family: &ColumnFamily, _key: &[u8], _value: &[u8]) {
-        match self.never {}
+    pub fn insert(&mut self, column_family: &ColumnFamily, key: &[u8], value: &[u8]) {
+        self.overlay.insert(column_family.index, key, value);
     }
 
     /// Sets `key` to an empty value.
@@ -244,23 +704,20 @@ impl Transaction {
     }
 
     /// Removes `key`.
-    pub fn remove(&mut self, _column_family: &ColumnFamily, _key: &[u8]) {
-        match self.never {}
+    pub fn remove(&mut self, column_family: &ColumnFamily, key: &[u8]) {
+        self.overlay.remove(column_family.index, key);
     }
 
-    /// Removes every key in `start_key..end_key` (end excluded).
-    pub fn remove_range(
-        &mut self,
-        _column_family: &ColumnFamily,
-        _start_key: &[u8],
-        _end_key: &[u8],
-    ) {
-        match self.never {}
+    /// Removes every key in `start_key..end_key` (end excluded), as of commit
+    /// time. Keys written after this call in the same transaction are kept.
+    pub fn remove_range(&mut self, column_family: &ColumnFamily, start_key: &[u8], end_key: &[u8]) {
+        self.overlay
+            .remove_range(column_family.index, start_key, end_key);
     }
 
     /// Applies all writes atomically.
     pub fn commit(self) -> Result<(), KvError> {
-        match self.never {}
+        self.db.commit(&self.overlay)
     }
 }
 
@@ -268,21 +725,28 @@ impl Transaction {
 ///
 /// Writes are visible to [`ReadableTransaction::reader`] immediately (including
 /// in iteration order) and to other readers only after
-/// [`ReadableTransaction::commit`]. Dropping it discards the writes.
+/// [`ReadableTransaction::commit`]. Dropping it discards the writes. As with
+/// the RocksDB backend, there is no conflict detection: the last commit wins.
 pub struct ReadableTransaction<'a> {
-    never: Never,
-    _lifetime: PhantomData<&'a ()>,
+    db: &'a DbInner,
+    snapshot: fjall::Snapshot,
+    overlay: Overlay,
 }
 
 impl ReadableTransaction<'_> {
     /// View of the snapshot merged with the pending writes.
     pub fn reader(&self) -> Reader<'_> {
-        match self.never {}
+        Reader {
+            kind: ReaderKind::Transaction {
+                snapshot: &self.snapshot,
+                overlay: &self.overlay,
+            },
+        }
     }
 
     /// Sets `key` to `value`.
-    pub fn insert(&mut self, _column_family: &ColumnFamily, _key: &[u8], _value: &[u8]) {
-        match self.never {}
+    pub fn insert(&mut self, column_family: &ColumnFamily, key: &[u8], value: &[u8]) {
+        self.overlay.insert(column_family.index, key, value);
     }
 
     /// Sets `key` to an empty value.
@@ -291,27 +755,24 @@ impl ReadableTransaction<'_> {
     }
 
     /// Removes `key`.
-    pub fn remove(&mut self, _column_family: &ColumnFamily, _key: &[u8]) {
-        match self.never {}
+    pub fn remove(&mut self, column_family: &ColumnFamily, key: &[u8]) {
+        self.overlay.remove(column_family.index, key);
     }
 
     /// Applies all writes atomically.
     pub fn commit(self) -> Result<(), KvError> {
-        match self.never {}
+        self.db.commit(&self.overlay)
     }
 }
 
-/// A value read from the database. Ideally borrowed from the engine's pages or
-/// cache rather than copied.
-pub struct PinnableSlice {
-    never: Never,
-}
+/// A value read from the database, shared with fjall's cache without copy.
+pub struct PinnableSlice(Slice);
 
 impl Deref for PinnableSlice {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        match self.never {}
+        &self.0
     }
 }
 
@@ -332,45 +793,41 @@ impl Borrow<[u8]> for PinnableSlice {
 /// Starts positioned on the first key (if any). Not a Rust [`Iterator`]
 /// because `key` borrows from the cursor.
 pub struct Iter<'a> {
-    never: Never,
-    /// Stand-ins for what a real cursor holds: the view it reads, its current
-    /// key and its upper bound. They give the placeholder a realistic size.
-    _reader: Reader<'a>,
-    _current_key: Vec<u8>,
-    _upper_bound: Option<Vec<u8>>,
+    // Boxed: Oxigraph keeps several iterators inline in its own enums
+    cursor: Box<Cursor<'a>>,
+    /// Keeps a read-only handle's private copy alive.
+    _db: Option<Arc<DbInner>>,
 }
 
 impl Iter<'_> {
     /// Whether the cursor is on a key.
     pub fn is_valid(&self) -> bool {
-        match self.never {}
+        self.cursor.key().is_some()
     }
 
     /// Reports a read error that made the cursor stop early.
     pub fn status(&self) -> Result<(), KvError> {
-        match self.never {}
+        self.cursor.status()
     }
 
     /// Moves to the next key.
     pub fn next(&mut self) {
-        match self.never {}
+        self.cursor.advance();
     }
 
     /// The current key, or `None` once the cursor is exhausted.
     pub fn key(&self) -> Option<&[u8]> {
-        match self.never {}
+        self.cursor.key()
     }
 }
 
 /// Writer for a sorted file to be added with [`Db::insert_stt_files`].
-pub struct SstFileWriter {
-    never: Never,
-}
+pub struct SstFileWriter(sst::Writer);
 
 impl SstFileWriter {
     /// Appends a key. Keys must be inserted in strictly increasing order.
-    pub fn insert(&mut self, _key: &[u8], _value: &[u8]) -> Result<(), KvError> {
-        match self.never {}
+    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
+        self.0.insert(key, value)
     }
 
     /// Appends a key with an empty value.
@@ -380,51 +837,9 @@ impl SstFileWriter {
 
     /// Finishes the file and returns its path.
     pub fn finish(self) -> Result<PathBuf, KvError> {
-        match self.never {}
+        self.0.finish()
     }
 }
 
-/// Errors returned by the engine.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum KvError {
-    /// An I/O error.
-    Io(io::Error),
-    /// The stored data is invalid.
-    Corruption(Box<dyn StdError + Send + Sync + 'static>),
-    /// The database has no column family with this name.
-    MissingColumnFamily(&'static str),
-    /// Any other error, e.g. writing through a read-only handle.
-    Other(Box<dyn StdError + Send + Sync + 'static>),
-    /// The placeholder engine has not been implemented yet.
-    Unimplemented,
-}
-
-impl fmt::Display for KvError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(e) => e.fmt(f),
-            Self::Corruption(e) | Self::Other(e) => e.fmt(f),
-            Self::MissingColumnFamily(name) => write!(f, "Column family {name} does not exist"),
-            Self::Unimplemented => {
-                f.write_str("the oxnative storage backend is not implemented yet")
-            }
-        }
-    }
-}
-
-impl StdError for KvError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            Self::Corruption(e) | Self::Other(e) => Some(&**e),
-            Self::MissingColumnFamily(_) | Self::Unimplemented => None,
-        }
-    }
-}
-
-impl From<io::Error> for KvError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
+#[cfg(test)]
+mod tests;
