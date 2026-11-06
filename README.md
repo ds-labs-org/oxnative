@@ -142,21 +142,30 @@ Checked on 2026-11-05 against fjall 3.1.13 / lsm-tree 3.1.10.
 
 Features of the `oxigraph` crate in the fork:
 
-| Feature       | Meaning                                                      |
-|---------------|--------------------------------------------------------------|
-| `rocksdb`     | On-disk storage (`Store::open` …). Needs one backend below.  |
-| `rocksdb-cpp` | RocksDB backend (C++, `oxrocksdb-sys`). In `default`.         |
-| `oxnative`    | This backend. Wins over `rocksdb-cpp` when both are enabled.  |
+| Feature    | Meaning                                                           |
+|------------|-------------------------------------------------------------------|
+| `rocksdb`  | RocksDB backend (C++, `oxrocksdb-sys`), as upstream. In `default`. |
+| `oxnative` | This backend. Wins over `rocksdb` when both are enabled.          |
 
-`rocksdb` keeps upstream's meaning for every `cfg(feature = "rocksdb")`, so none
-of them had to change. The switch is in `lib/oxigraph/src/storage/mod.rs`: with
-`oxnative`, the module `rocksdb_wrapper` is loaded from `oxnative_wrapper.rs`
-(forwards to this crate and converts `KvError` into `StorageError`) instead of
+A pure-Rust build is `--no-default-features --features oxnative`: it enables
+nothing named RocksDB, and `oxrocksdb-sys` is not in its dependency graph.
+
+Either feature enables on-disk storage (`Store::open` and friends). Upstream
+gates it on `feature = "rocksdb"`; the fork gates it on `cfg(oxigraph_on_disk)`,
+set by `lib/oxigraph/build.rs` when `rocksdb` or `oxnative` is enabled. The
+backend is picked in `lib/oxigraph/src/storage/mod.rs`: with `oxnative`, the
+module `rocksdb_wrapper` is loaded from `oxnative_wrapper.rs` (forwards to this
+crate and converts `KvError` into `StorageError`) instead of
 `rocksdb_wrapper.rs` (RocksDB FFI).
 
-The fork depends on this repository's `main` branch through git
-(`oxnative = { git = "https://github.com/ds-labs-org/oxnative", branch = "main" }`
-in its workspace `Cargo.toml`). To develop both side by side, clone this
+When a rebase on upstream conflicts on one of these gates, take upstream's line
+and replace `feature = "rocksdb"` with `oxigraph_on_disk` again; the only
+`feature = "rocksdb"` left in `lib/oxigraph` is the backend selection in
+`storage/mod.rs`.
+
+The fork depends on this repository through git, on the branch carrying the
+current engine (`claude/rust-persistence-layer-7uk3u0` until it is merged into
+`main`), in its workspace `Cargo.toml`. To develop both side by side, clone this
 repository next to the fork and add to the fork's workspace `Cargo.toml`:
 
 ```toml
