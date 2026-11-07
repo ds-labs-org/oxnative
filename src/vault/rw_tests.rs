@@ -37,14 +37,7 @@ fn vault_options() -> VaultOptions {
 }
 
 fn open_vault(path: &Path) -> Result<Db, KvError> {
-    Db::open_read_write(
-        path,
-        definitions(),
-        DbOptions {
-            vault: Some(vault_options()),
-            ..DbOptions::default()
-        },
-    )
+    Db::open_read_write_with_vault(path, definitions(), DbOptions::default(), vault_options())
 }
 
 fn open_plain_db(path: &Path) -> Result<Db, KvError> {

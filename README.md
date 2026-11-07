@@ -154,15 +154,13 @@ Not protected:
 use oxnative::{ColumnFamilyDefinition, Db, DbOptions, VaultKey, VaultOptions};
 
 let key = VaultKey::new(key_bytes); // [u8; 32]; VaultKey::try_from(&[u8]) checks the length
-let db = Db::open_read_write(
+let db = Db::open_read_write_with_vault(
     path,
     column_families, // Vec<ColumnFamilyDefinition>, including "id2str"
-    DbOptions {
-        vault: Some(VaultOptions {
-            key,
-            vault_column_families: vec!["id2str"],
-        }),
-        ..DbOptions::default()
+    DbOptions::default(),
+    VaultOptions {
+        key,
+        vault_column_families: vec!["id2str"],
     },
 )?;
 // then use `get`, `insert`, transactions, `iter`, `scan_prefix`, `new_sst_file_for`
@@ -172,9 +170,9 @@ let db = Db::open_read_write(
 // Db::open_read_only_with_vault(path, column_families, vault_options)
 ```
 
-`DbOptions` is no longer `Copy` when the feature is on (it holds the key). With
-the feature off the `vault` field does not exist. `Db::open_read_only` on a
-vaulted database, and `Db::open_read_write` without `vault` on one, fail.
+`DbOptions` is identical with and without the feature (still `Copy`, no vault
+field): the feature is additive. `Db::open_read_only` on a vaulted database, and
+`Db::open_read_write` on one, fail.
 For bulk loads of a vault column family use `new_sst_file_for(&cf)`: a file
 from `new_sst_file()` would hold plaintext, so it fails on a database with vault
 column families (and `insert_stt_files` refuses such files for them).
@@ -209,7 +207,7 @@ nothing; the term ids are hashes, which only leak equality and the graph
 structure. Leave them, and `default`/`graphs`, plain unless the graph names
 themselves are secret (the `graphs` keys are the encoded graph names).
 
-In the fork, in `oxnative_wrapper.rs`, pass `DbOptions::vault` and call
+In the fork, in `oxnative_wrapper.rs`, call `Db::open_read_write_with_vault` and
 `Db::open_read_only_with_vault` for read-only handles; `Store::open` and
 friends take the key from the caller, so the fork needs an opening function
 that accepts it. Its bulk loader must create the `id2str` files with

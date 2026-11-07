@@ -42,13 +42,11 @@ fn vault_options(key: [u8; 32]) -> VaultOptions {
 }
 
 fn open_vault_with(path: &Path, key: [u8; 32]) -> Result<Db, KvError> {
-    Db::open_read_write(
+    Db::open_read_write_with_vault(
         path,
         definitions(),
-        DbOptions {
-            vault: Some(vault_options(key)),
-            ..DbOptions::default()
-        },
+        DbOptions::default(),
+        vault_options(key),
     )
 }
 
@@ -845,15 +843,13 @@ fn new_sst_file_is_refused_on_a_vault_database_and_writes_nothing() -> TestResul
 #[test]
 fn new_sst_file_still_works_when_no_cf_is_vaulted() -> TestResult {
     let dir = TempDir::new()?;
-    let db = Db::open_read_write(
+    let db = Db::open_read_write_with_vault(
         dir.path(),
         definitions(),
-        DbOptions {
-            vault: Some(VaultOptions {
-                key: VaultKey::new(KEY_A),
-                vault_column_families: vec![],
-            }),
-            ..DbOptions::default()
+        DbOptions::default(),
+        VaultOptions {
+            key: VaultKey::new(KEY_A),
+            vault_column_families: vec![],
         },
     )?;
     drop(db.new_sst_file()?);

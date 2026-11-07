@@ -40,13 +40,11 @@ fn vault_options(key: [u8; 32]) -> VaultOptions {
 }
 
 fn open_vault(path: &Path, key: [u8; 32]) -> Result<Db, KvError> {
-    Db::open_read_write(
+    Db::open_read_write_with_vault(
         path,
         definitions(),
-        DbOptions {
-            vault: Some(vault_options(key)),
-            ..DbOptions::default()
-        },
+        DbOptions::default(),
+        vault_options(key),
     )
 }
 
@@ -405,15 +403,13 @@ fn open_vault_with_set(
     key: [u8; 32],
     vault_column_families: Vec<&'static str>,
 ) -> Result<Db, KvError> {
-    Db::open_read_write(
+    Db::open_read_write_with_vault(
         path,
         definitions(),
-        DbOptions {
-            vault: Some(VaultOptions {
-                key: VaultKey::new(key),
-                vault_column_families,
-            }),
-            ..DbOptions::default()
+        DbOptions::default(),
+        VaultOptions {
+            key: VaultKey::new(key),
+            vault_column_families,
         },
     )
 }

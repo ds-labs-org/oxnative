@@ -228,22 +228,14 @@ fn two_values_of_the_same_record_are_not_interchangeable_across_keys() -> TestRe
 // --- options wiring and non-regression of plain databases ---
 
 #[test]
-fn vault_options_are_wired_into_db_options() {
-    assert!(DbOptions::default().vault.is_none(), "plain by default");
-    let options = DbOptions {
-        vault: Some(VaultOptions {
-            key: key(KEY_A),
-            vault_column_families: vec!["a"],
-        }),
-        ..DbOptions::default()
+fn vault_options_clone_keeps_key_and_column_families() {
+    let options = VaultOptions {
+        key: key(KEY_A),
+        vault_column_families: vec!["a"],
     };
     let cloned = options.clone();
-    let vault = cloned.vault.as_ref();
-    assert_eq!(
-        vault.map(|v| v.vault_column_families.clone()),
-        Some(vec!["a"])
-    );
-    assert_eq!(vault.map(|v| *v.key.as_bytes()), Some(KEY_A));
+    assert_eq!(cloned.vault_column_families, vec!["a"]);
+    assert_eq!(*cloned.key.as_bytes(), KEY_A);
 }
 
 #[test]

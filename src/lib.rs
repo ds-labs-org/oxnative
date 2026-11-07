@@ -75,18 +75,13 @@ pub struct ColumnFamilyDefinition {
 }
 
 /// Options for [`Db::open_read_write`].
-#[derive(Clone, Debug, Default)]
-#[cfg_attr(not(feature = "vault"), derive(Copy))]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct DbOptions {
     /// Maximum number of table files kept open.
     pub max_open_files: Option<i32>,
     /// Number of file descriptors to leave to the rest of the process. Not
     /// used by this engine.
     pub fd_reserve: Option<u32>,
-    /// Encryption of the vault column families. `None` keeps the database
-    /// plain.
-    #[cfg(feature = "vault")]
-    pub vault: Option<VaultOptions>,
 }
 
 /// A database handle. Cheap to clone, `Send + Sync`.
@@ -127,8 +122,16 @@ impl Db {
         column_families: Vec<ColumnFamilyDefinition>,
         db_options: DbOptions,
     ) -> Result<Self, KvError> {
-        let vault = db_options_vault(&db_options);
-        check_vault_column_families(&column_families, vault)?;
+        Self::open_read_write_inner(path, &column_families, db_options, None)
+    }
+
+    fn open_read_write_inner(
+        path: &Path,
+        column_families: &[ColumnFamilyDefinition],
+        db_options: DbOptions,
+        vault: Option<&VaultOptions>,
+    ) -> Result<Self, KvError> {
+        check_vault_column_families(column_families, vault)?;
         let created = prepare_root(path, vault.is_some())?;
         let mut builder = fjall::Database::builder(path.join(FJALL_DIR));
         if let Some(max_open_files) = db_options
@@ -140,7 +143,7 @@ impl Db {
         }
         let db = builder.open()?;
         verify_vault_state(&db, vault, created, true)?;
-        let inner = DbInner::new(db, &column_families, vault, path, true, None)?;
+        let inner = DbInner::new(db, column_families, vault, path, true, None)?;
         inner.recover_bulk_load()?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -180,16 +183,23 @@ impl Db {
     }
 
     /// Opens or creates a vaulted database at `path` in read-write mode.
+    ///
+    /// The key in `vault` is required and checked; `vault.vault_column_families`
+    /// names the column families whose values are encrypted. A plain database
+    /// cannot be opened this way, nor a vaulted one with
+    /// [`Db::open_read_write`].
     #[cfg(feature = "vault")]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "same shape as the other open functions"
+    )]
     pub fn open_read_write_with_vault(
-        _path: &Path,
-        _column_families: Vec<ColumnFamilyDefinition>,
-        _db_options: DbOptions,
-        _vault: VaultOptions,
+        path: &Path,
+        column_families: Vec<ColumnFamilyDefinition>,
+        db_options: DbOptions,
+        vault: VaultOptions,
     ) -> Result<Self, KvError> {
-        Err(KvError::other(
-            "open_read_write_with_vault is not implemented",
-        ))
+        Self::open_read_write_inner(path, &column_families, db_options, Some(&vault))
     }
 
     fn open_read_only_inner(
@@ -756,16 +766,6 @@ fn write_marker(path: &Path, vault: bool) -> Result<(), KvError> {
     }
     file.sync_all()?;
     Ok(())
-}
-
-#[cfg(feature = "vault")]
-fn db_options_vault(options: &DbOptions) -> Option<&VaultOptions> {
-    options.vault.as_ref()
-}
-
-#[cfg(not(feature = "vault"))]
-fn db_options_vault(_options: &DbOptions) -> Option<&VaultOptions> {
-    None
 }
 
 /// Fails closed unless the stored key check agrees with how the database is
