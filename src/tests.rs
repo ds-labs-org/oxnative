@@ -438,3 +438,27 @@ fn plain_database_still_opens_after_a_refused_vault_open() -> TestResult {
     );
     Ok(())
 }
+
+// --- a build without vault support refuses the vault format (#11) ---
+
+#[test]
+fn plain_open_refuses_the_second_format_marker() -> TestResult {
+    let dir = TempDir::new()?;
+    {
+        let db = open(dir.path())?;
+        let cf = db.column_family("a")?;
+        commit_keys(&db, &cf, &["k"])?;
+    }
+    for marker in [
+        "oxnative 2\nengine fjall 3\nvault 1\n",
+        "oxnative 2\nengine fjall 3\n",
+    ] {
+        fs::write(dir.path().join("OXNATIVE"), marker)?;
+        assert!(open(dir.path()).is_err(), "{marker:?}");
+        assert!(
+            Db::open_read_only(dir.path(), definitions()).is_err(),
+            "{marker:?}"
+        );
+    }
+    Ok(())
+}

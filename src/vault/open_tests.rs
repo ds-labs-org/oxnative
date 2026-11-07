@@ -464,3 +464,60 @@ fn backup_keeps_the_vault_cf_set() -> TestResult {
     drop(open_vault(&target, KEY_A)?);
     Ok(())
 }
+
+// --- vaulted databases are refused by pre-vault builds (#11) ---
+
+/// The marker check of the build before the vault feature, copied verbatim
+/// from `main:src/lib.rs` (`check_marker`): it compares the first line only.
+fn old_build_accepts_marker(path: &Path) -> Result<bool, Box<dyn Error>> {
+    const OLD_MARKER_CONTENT: &str = "oxnative 1\nengine fjall 3\n";
+    let content = fs::read_to_string(path.join(MARKER_PATH))?;
+    Ok(content.lines().next() == OLD_MARKER_CONTENT.lines().next())
+}
+
+#[test]
+fn vault_and_plain_markers_have_different_first_lines() -> TestResult {
+    let plain_dir = TempDir::new()?;
+    drop(open_plain(plain_dir.path())?);
+    let vault_dir = TempDir::new()?;
+    create_vault_db(vault_dir.path(), KEY_A)?;
+    let plain = fs::read_to_string(plain_dir.path().join(MARKER_PATH))?;
+    let vault = fs::read_to_string(vault_dir.path().join(MARKER_PATH))?;
+    assert_eq!(plain.lines().next(), Some("oxnative 1"));
+    assert_eq!(
+        vault.lines().next(),
+        Some("oxnative 2"),
+        "a vaulted database must change the first marker line"
+    );
+    assert_eq!(
+        vault, "oxnative 2\nengine fjall 3\nvault 1\n",
+        "the rest of the vault marker is unchanged"
+    );
+    Ok(())
+}
+
+#[test]
+fn first_line_only_check_of_the_old_build_rejects_a_vaulted_database() -> TestResult {
+    let vault_dir = TempDir::new()?;
+    create_vault_db(vault_dir.path(), KEY_A)?;
+    assert!(
+        !old_build_accepts_marker(vault_dir.path())?,
+        "a pre-vault build would open the database and write plaintext into vault CFs"
+    );
+    let plain_dir = TempDir::new()?;
+    drop(open_plain(plain_dir.path())?);
+    assert!(
+        old_build_accepts_marker(plain_dir.path())?,
+        "sanity: the replicated old check accepts a plain database"
+    );
+    Ok(())
+}
+
+#[test]
+fn vault_marker_stays_after_reopen_and_still_rejected_by_old_check() -> TestResult {
+    let dir = TempDir::new()?;
+    create_vault_db(dir.path(), KEY_A)?;
+    drop(open_vault(dir.path(), KEY_A)?);
+    assert!(!old_build_accepts_marker(dir.path())?);
+    Ok(())
+}
