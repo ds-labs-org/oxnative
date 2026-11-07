@@ -14,9 +14,10 @@ use crate::overlay::{Cursor, Overlay};
 pub use crate::vault::{VaultKey, VaultOptions};
 use fjall::config::CompressionPolicy;
 use fjall::{CompressionType, KeyspaceCreateOptions, PersistMode, Readable, Slice};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::BTreeMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write as _};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -130,7 +131,7 @@ impl Db {
         }
         let db = builder.open()?;
         verify_vault_state(&db, vault, created)?;
-        let inner = DbInner::new(db, &column_families, path, true, None)?;
+        let inner = DbInner::new(db, &column_families, vault, path, true, None)?;
         inner.recover_bulk_load()?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -185,7 +186,7 @@ impl Db {
         let copy = PrivateCopy::create(&source, path)?;
         let db = fjall::Database::builder(copy.path()).open()?;
         verify_vault_state(&db, vault, false)?;
-        let inner = DbInner::new(db, column_families, path, false, Some(copy))?;
+        let inner = DbInner::new(db, column_families, vault, path, false, Some(copy))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -244,7 +245,11 @@ impl Db {
         key: &[u8],
     ) -> Result<Option<PinnableSlice>, KvError> {
         let _visibility = self.inner.read_visibility();
-        Ok(column_family.keyspace.get(key)?.map(PinnableSlice))
+        column_family
+            .keyspace
+            .get(key)?
+            .map(|value| column_family.unseal(key, value))
+            .transpose()
     }
 
     /// Whether `key` exists in the latest committed state.
@@ -262,7 +267,9 @@ impl Db {
     ) -> Result<(), KvError> {
         self.inner.check_writable("Insert")?;
         let _commit = self.inner.lock_commit()?;
-        Ok(column_family.keyspace.insert(key, value)?)
+        Ok(column_family
+            .keyspace
+            .insert(key, column_family.seal(key, value)?.as_ref())?)
     }
 
     /// Persists all committed writes to disk.
@@ -345,9 +352,14 @@ impl Db {
 }
 
 impl DbInner {
+    #[cfg_attr(
+        not(feature = "vault"),
+        expect(unused_variables, reason = "only vaulted databases need it")
+    )]
     fn new(
         db: fjall::Database,
         definitions: &[ColumnFamilyDefinition],
+        vault: Option<&VaultOptions>,
         root: &Path,
         writable: bool,
         copy: Option<PrivateCopy>,
@@ -356,6 +368,19 @@ impl DbInner {
         let mut names = definitions.iter().map(|d| d.name).collect::<Vec<_>>();
         if !names.contains(&DEFAULT_COLUMN_FAMILY) {
             names.push(DEFAULT_COLUMN_FAMILY);
+        }
+        #[cfg(feature = "vault")]
+        let vault_key = vault.map(|v| Arc::new(v.key.clone()));
+        #[cfg(feature = "vault")]
+        if let Some(vault) = vault
+            && let Some(unknown) = vault
+                .vault_column_families
+                .iter()
+                .find(|name| !names.contains(name))
+        {
+            return Err(KvError::other(format!(
+                "vault column family {unknown:?} is not a column family of the database"
+            )));
         }
         let mut column_families = Vec::with_capacity(names.len());
         for (index, name) in names.into_iter().enumerate() {
@@ -368,7 +393,18 @@ impl DbInner {
                 return Err(KvError::MissingColumnFamily(name));
             }
             let keyspace = db.keyspace(name, keyspace_options)?;
-            column_families.push((name, ColumnFamily { index, keyspace }));
+            column_families.push((
+                name,
+                ColumnFamily {
+                    index,
+                    keyspace,
+                    #[cfg(feature = "vault")]
+                    seal: vault
+                        .zip(vault_key.as_ref())
+                        .filter(|(v, _)| v.vault_column_families.contains(&name))
+                        .map(|(_, key)| vault::Seal::new(Arc::clone(key), name)),
+                },
+            ));
         }
         let meta = db.keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)?;
         Ok(Self {
@@ -437,7 +473,9 @@ impl DbInner {
             let cf = self.column_family_at(index)?;
             for (key, value) in writes {
                 match value {
-                    Some(value) => batch.insert(&cf.keyspace, key.as_slice(), value.as_slice()),
+                    Some(value) => {
+                        batch.insert(&cf.keyspace, key.as_slice(), cf.seal(key, value)?.as_ref())
+                    }
                     None => batch.remove(&cf.keyspace, key.as_slice()),
                 }
             }
@@ -712,10 +750,64 @@ fn unique_suffix() -> String {
 }
 
 /// Handle to a column family. Cheap to clone, `Send + Sync`, usable as a map key.
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone)]
 pub struct ColumnFamily {
     index: usize,
     keyspace: fjall::Keyspace,
+    /// Present for vault column families: encrypts their values.
+    #[cfg(feature = "vault")]
+    seal: Option<vault::Seal>,
+}
+
+impl ColumnFamily {
+    /// The bytes stored for `value`: encrypted in a vault column family.
+    #[cfg(feature = "vault")]
+    fn seal<'v>(&self, key: &[u8], value: &'v [u8]) -> Result<Cow<'v, [u8]>, KvError> {
+        match &self.seal {
+            Some(seal) => seal.seal(key, value).map(Cow::Owned),
+            None => Ok(Cow::Borrowed(value)),
+        }
+    }
+
+    #[cfg(not(feature = "vault"))]
+    #[expect(clippy::unnecessary_wraps, reason = "same signature as with `vault`")]
+    #[expect(clippy::unused_self, reason = "same signature as with `vault`")]
+    fn seal<'v>(&self, _key: &[u8], value: &'v [u8]) -> Result<Cow<'v, [u8]>, KvError> {
+        Ok(Cow::Borrowed(value))
+    }
+
+    /// The value read from the database: decrypted in a vault column family.
+    #[cfg(feature = "vault")]
+    fn unseal(&self, key: &[u8], stored: Slice) -> Result<PinnableSlice, KvError> {
+        match &self.seal {
+            Some(seal) => seal
+                .open(key, &stored)
+                .map(|v| PinnableSlice(Slice::from(v))),
+            None => Ok(PinnableSlice(stored)),
+        }
+    }
+
+    #[cfg(not(feature = "vault"))]
+    #[expect(clippy::unnecessary_wraps, reason = "same signature as with `vault`")]
+    #[expect(clippy::unused_self, reason = "same signature as with `vault`")]
+    fn unseal(&self, _key: &[u8], stored: Slice) -> Result<PinnableSlice, KvError> {
+        Ok(PinnableSlice(stored))
+    }
+}
+
+impl PartialEq for ColumnFamily {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && self.keyspace == other.keyspace
+    }
+}
+
+impl Eq for ColumnFamily {}
+
+impl Hash for ColumnFamily {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.index.hash(state);
+        self.keyspace.hash(state);
+    }
 }
 
 /// A read view: a snapshot ([`Db::snapshot`]) or a transaction's own view
@@ -746,16 +838,18 @@ impl<'a> Reader<'a> {
         key: &[u8],
     ) -> Result<Option<PinnableSlice>, KvError> {
         match &self.kind {
-            ReaderKind::Snapshot { snapshot, .. } => Ok(snapshot
+            ReaderKind::Snapshot { snapshot, .. } => snapshot
                 .get(&column_family.keyspace, key)?
-                .map(PinnableSlice)),
+                .map(|value| column_family.unseal(key, value))
+                .transpose(),
             ReaderKind::Transaction { snapshot, overlay } => {
                 match overlay.get(column_family.index, key) {
                     Some(Some(value)) => Ok(Some(PinnableSlice(Slice::from(value.as_slice())))),
                     Some(None) => Ok(None),
-                    None => Ok(snapshot
+                    None => snapshot
                         .get(&column_family.keyspace, key)?
-                        .map(PinnableSlice)),
+                        .map(|value| column_family.unseal(key, value))
+                        .transpose(),
                 }
             }
         }

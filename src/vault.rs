@@ -4,6 +4,7 @@ use crate::{KvError, META_KEYSPACE, VAULT_CHECK_KEY};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload};
 use chacha20poly1305::{AeadCore, Key, XChaCha20Poly1305, XNonce};
 use std::fmt;
+use std::sync::Arc;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const FORMAT_VERSION: u8 = 1;
@@ -75,6 +76,27 @@ pub struct VaultOptions {
     pub key: VaultKey,
     /// Names of the column families whose values are encrypted.
     pub vault_column_families: Vec<&'static str>,
+}
+
+/// Encrypts and decrypts the values of one vault column family.
+#[derive(Clone)]
+pub(crate) struct Seal {
+    key: Arc<VaultKey>,
+    column_family: &'static str,
+}
+
+impl Seal {
+    pub(crate) fn new(key: Arc<VaultKey>, column_family: &'static str) -> Self {
+        Self { key, column_family }
+    }
+
+    pub(crate) fn seal(&self, record_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, KvError> {
+        seal(&self.key, self.column_family, record_key, plaintext)
+    }
+
+    pub(crate) fn open(&self, record_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>, KvError> {
+        open(&self.key, self.column_family, record_key, sealed)
+    }
 }
 
 const CHECK_PLAINTEXT: &[u8] = b"oxnative vault key check";
