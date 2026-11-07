@@ -163,10 +163,12 @@ and replace `feature = "rocksdb"` with `oxigraph_on_disk` again; the only
 `feature = "rocksdb"` left in `lib/oxigraph` is the backend selection in
 `storage/mod.rs`.
 
-The fork depends on this repository through git, on the branch carrying the
-current engine (`claude/rust-persistence-layer-7uk3u0` until it is merged into
-`main`), in its workspace `Cargo.toml`. To develop both side by side, clone this
-repository next to the fork and add to the fork's workspace `Cargo.toml`:
+The fork depends on this repository through git, in its workspace
+`Cargo.toml`: its branch based on upstream `main` (0.6) follows this
+repository's `main`, and its `oxnative-0.5` branch (upstream v0.5.9 plus the
+`oxnative` feature) pins a commit with `rev`. To develop both side by side,
+clone this repository next to the fork and add to the fork's workspace
+`Cargo.toml`:
 
 ```toml
 [patch."https://github.com/ds-labs-org/oxnative"]
@@ -182,7 +184,8 @@ When the fork is rebased on upstream, the only file to watch is
 `lib/oxigraph/src/storage/rocksdb_wrapper.rs`: any method added or changed there
 must be mirrored here and in the fork's `oxnative_wrapper.rs`. The fork's CI runs
 `cargo clippy --no-default-features --features oxnative`, so a mismatch fails its
-build.
+build. This crate keeps the union of what the fork's branches need: for example
+`From<PinnableSlice> for Vec<u8>`, which only Oxigraph 0.5 uses.
 
 ## Acceptance tests
 
