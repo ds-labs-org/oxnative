@@ -174,4 +174,6 @@ pub(crate) fn open(
 #[cfg(test)]
 mod open_tests;
 #[cfg(test)]
+mod rw_tests;
+#[cfg(test)]
 mod tests;
