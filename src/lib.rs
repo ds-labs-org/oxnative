@@ -1261,4 +1261,6 @@ impl SstFileWriter {
 }
 
 #[cfg(test)]
+mod bulk_order_tests;
+#[cfg(test)]
 mod tests;
