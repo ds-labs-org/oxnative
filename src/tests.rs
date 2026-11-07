@@ -69,6 +69,7 @@ fn snapshot_isolation_and_reopen() -> TestResult {
         let after = db.snapshot();
         assert_eq!(keys(after.iter(&cf))?, bytes(&["k1", "k2"]));
         assert_eq!(after.get(&cf, b"k1")?.as_deref(), Some(&b"v"[..]));
+        assert_eq!(after.get(&cf, b"k1")?.map(Vec::from), Some(b"v".to_vec()));
         assert_eq!(after.len(&cf)?, 2);
     }
     let db = open(dir.path())?;

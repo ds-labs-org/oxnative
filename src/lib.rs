@@ -788,6 +788,14 @@ impl Borrow<[u8]> for PinnableSlice {
     }
 }
 
+/// Copies the value. Oxigraph 0.5's `rocksdb_wrapper.rs` has this
+/// conversion (its `rocksdb.rs` uses it to read `id2str`); 0.6 dropped it.
+impl From<PinnableSlice> for Vec<u8> {
+    fn from(value: PinnableSlice) -> Self {
+        value.to_vec()
+    }
+}
+
 /// Cursor over keys in increasing byte order.
 ///
 /// Starts positioned on the first key (if any). Not a Rust [`Iterator`]
