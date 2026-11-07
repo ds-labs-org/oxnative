@@ -376,3 +376,10 @@ fn large_overlapping_bulk_load() -> TestResult {
     assert!(snapshot.contains_key(&cf, b"existing")?);
     Ok(())
 }
+
+#[cfg(not(feature = "vault"))]
+#[test]
+fn db_options_stay_copy_without_the_vault_feature() {
+    fn assert_copy<T: Copy>() {}
+    assert_copy::<DbOptions>();
+}

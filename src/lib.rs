@@ -4,10 +4,14 @@ mod copy;
 mod error;
 mod overlay;
 mod sst;
+#[cfg(feature = "vault")]
+mod vault;
 
 use crate::copy::PrivateCopy;
 pub use crate::error::KvError;
 use crate::overlay::{Cursor, Overlay};
+#[cfg(feature = "vault")]
+pub use crate::vault::{VaultKey, VaultOptions};
 use fjall::config::CompressionPolicy;
 use fjall::{CompressionType, KeyspaceCreateOptions, PersistMode, Readable, Slice};
 use std::borrow::Borrow;
@@ -51,13 +55,18 @@ pub struct ColumnFamilyDefinition {
 }
 
 /// Options for [`Db::open_read_write`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(not(feature = "vault"), derive(Copy))]
 pub struct DbOptions {
     /// Maximum number of table files kept open.
     pub max_open_files: Option<i32>,
     /// Number of file descriptors to leave to the rest of the process. Not
     /// used by this engine.
     pub fd_reserve: Option<u32>,
+    /// Encryption of the vault column families. `None` keeps the database
+    /// plain.
+    #[cfg(feature = "vault")]
+    pub vault: Option<VaultOptions>,
 }
 
 /// A database handle. Cheap to clone, `Send + Sync`.
