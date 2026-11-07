@@ -90,6 +90,10 @@ impl Seal {
         Self { key, column_family }
     }
 
+    pub(crate) fn column_family(&self) -> &'static str {
+        self.column_family
+    }
+
     pub(crate) fn seal(&self, record_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, KvError> {
         seal(&self.key, self.column_family, record_key, plaintext)
     }

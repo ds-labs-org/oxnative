@@ -300,11 +300,26 @@ impl Db {
     /// Creates a writer for a sorted file meant for `column_family`. For a
     /// vault column family the values are sealed in the file, which then only
     /// loads into that column family of a database with the same key.
-    pub fn new_sst_file_for(
-        &self,
-        _column_family: &ColumnFamily,
-    ) -> Result<SstFileWriter, KvError> {
-        // RED stub (#7): behaves like `new_sst_file`, so values stay plaintext.
+    #[cfg_attr(
+        not(feature = "vault"),
+        expect(unused_variables, reason = "only vault column families differ")
+    )]
+    pub fn new_sst_file_for(&self, column_family: &ColumnFamily) -> Result<SstFileWriter, KvError> {
+        #[cfg(feature = "vault")]
+        if let Some(seal) = &column_family.seal {
+            self.inner.check_writable("Bulk-load file creation")?;
+            let path = self
+                .inner
+                .root
+                .join(BULK_DIR)
+                .join(format!("{}.sst", unique_suffix()));
+            let seal = seal.clone();
+            return Ok(SstFileWriter(sst::Writer::create_sealed(
+                path,
+                seal.column_family(),
+                Box::new(move |key, value| seal.seal(key, value)),
+            )?));
+        }
         self.new_sst_file()
     }
 
@@ -320,7 +335,6 @@ impl Db {
         if ssts_for_cf.is_empty() {
             return Ok(());
         }
-        refuse_vault_bulk_load(ssts_for_cf.iter().map(|(cf, _)| cf))?;
         let mut by_cf = BTreeMap::<usize, (&ColumnFamily, Vec<PathBuf>)>::new();
         for (cf, path) in ssts_for_cf {
             by_cf
@@ -328,6 +342,10 @@ impl Db {
                 .or_insert_with(|| (cf, Vec::new()))
                 .1
                 .push(path.clone());
+        }
+        // Sealed files are checked whole before anything is recorded or loaded
+        for (cf, paths) in by_cf.values() {
+            cf.verify_bulk_files(paths)?;
         }
         let _commit = self.inner.lock_commit()?;
         self.inner.write_bulk_load_record(by_cf.values())?;
@@ -338,7 +356,7 @@ impl Db {
                 .write()
                 .map_err(|_| KvError::poisoned())?;
             for (cf, paths) in by_cf.values() {
-                sst::ingest(&cf.keyspace, paths)?;
+                sst::ingest(&cf.keyspace, paths, cf.sealed_name())?;
             }
         }
         self.inner.clear_bulk_load_record()
@@ -351,18 +369,6 @@ impl Db {
     /// The copy is logical (every key is rewritten), so it takes time and space
     /// proportional to the database size.
     pub fn backup(&self, target_directory: &Path) -> Result<(), KvError> {
-        // Until vault backups are supported (#7) the copy would lose the vault
-        // marker and key check, so it would open as a plain database.
-        if self
-            .inner
-            .column_families
-            .iter()
-            .any(|(_, cf)| cf.is_vault())
-        {
-            return Err(KvError::other(
-                "backup of a vaulted database is not supported yet",
-            ));
-        }
         #[expect(clippy::create_dir, reason = "the target must not exist yet")]
         fs::create_dir(target_directory)?;
         let result = self.inner.backup_into(target_directory);
@@ -563,7 +569,6 @@ impl DbInner {
                 .split_once('\t')
                 .ok_or_else(|| KvError::corruption("invalid bulk-load record"))?;
             let cf = self.column_family_named(name)?;
-            refuse_vault_bulk_load(std::iter::once(cf))?;
             by_cf
                 .entry(cf.index)
                 .or_insert_with(|| (cf, Vec::new()))
@@ -573,7 +578,10 @@ impl DbInner {
         // Re-ingesting a column family that was already ingested is harmless:
         // the files hold the same keys and values.
         for (cf, paths) in by_cf.values() {
-            sst::ingest(&cf.keyspace, paths)?;
+            cf.verify_bulk_files(paths)?;
+        }
+        for (cf, paths) in by_cf.values() {
+            sst::ingest(&cf.keyspace, paths, cf.sealed_name())?;
         }
         self.clear_bulk_load_record()?;
         for (_, paths) in by_cf.values() {
@@ -587,10 +595,17 @@ impl DbInner {
     }
 
     fn backup_into(&self, target: &Path) -> Result<(), KvError> {
-        write_marker(target, false)?;
+        // Vault values are copied as stored, still sealed, and the backup keeps
+        // the vault marker and key check so that it opens like the source.
+        let check = self.meta.get(VAULT_CHECK_KEY)?;
+        write_marker(target, check.is_some())?;
         #[expect(clippy::create_dir, reason = "the target was just created")]
         fs::create_dir(target.join(BULK_DIR))?;
         let target_db = fjall::Database::builder(target.join(FJALL_DIR)).open()?;
+        if let Some(check) = check {
+            let meta = target_db.keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)?;
+            meta.insert(VAULT_CHECK_KEY, check)?;
+        }
         let snapshot = self.snapshot();
         for (name, cf) in &self.column_families {
             let keyspace = target_db.keyspace(name, keyspace_options)?;
@@ -784,29 +799,38 @@ pub struct ColumnFamily {
     seal: Option<vault::Seal>,
 }
 
-/// Bulk-load files hold plain values, which a vault column family could not
-/// read back: refused until sealed bulk loads exist (#7).
-fn refuse_vault_bulk_load<'a>(
-    mut cfs: impl Iterator<Item = &'a ColumnFamily>,
-) -> Result<(), KvError> {
-    if cfs.any(ColumnFamily::is_vault) {
-        return Err(KvError::other(
-            "bulk loading into a vault column family is not supported yet",
-        ));
-    }
-    Ok(())
-}
-
 impl ColumnFamily {
+    /// Name to look for in bulk-load files: files of a vault column family are
+    /// sealed for it.
     #[cfg(feature = "vault")]
-    fn is_vault(&self) -> bool {
-        self.seal.is_some()
+    fn sealed_name(&self) -> Option<&'static str> {
+        self.seal.as_ref().map(vault::Seal::column_family)
     }
 
     #[cfg(not(feature = "vault"))]
     #[expect(clippy::unused_self, reason = "same signature as with `vault`")]
-    fn is_vault(&self) -> bool {
-        false
+    fn sealed_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Checks the files before a load: of the right kind and, for a vault
+    /// column family, with every sealed value opening. Nothing is loaded or
+    /// recorded when it fails.
+    #[cfg(feature = "vault")]
+    fn verify_bulk_files(&self, paths: &[PathBuf]) -> Result<(), KvError> {
+        match &self.seal {
+            Some(seal) => sst::verify(
+                paths,
+                Some((seal.column_family(), &|key, value| seal.open(key, value))),
+            ),
+            None => sst::verify(paths, None),
+        }
+    }
+
+    #[cfg(not(feature = "vault"))]
+    #[expect(clippy::unused_self, reason = "same signature as with `vault`")]
+    fn verify_bulk_files(&self, paths: &[PathBuf]) -> Result<(), KvError> {
+        sst::verify(paths, None)
     }
 
     /// The bytes stored for `value`: encrypted in a vault column family.
