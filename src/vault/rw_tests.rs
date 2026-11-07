@@ -620,7 +620,7 @@ fn a_tampered_value_does_not_poison_other_keys_or_plain_cfs() -> TestResult {
     Ok(())
 }
 
-// --- bulk loads and backups are refused on vaults until #7 ---
+// --- unsealed bulk loads are refused on vaults (sealed ones: #7) ---
 
 #[test]
 fn bulk_load_into_a_vault_cf_is_refused_and_leaves_no_plaintext() -> TestResult {
@@ -661,19 +661,5 @@ fn bulk_load_into_a_plain_cf_of_a_vault_database_still_works() -> TestResult {
     file.insert(b"k", b"v")?;
     db.insert_stt_files(&[(plain.clone(), file.finish()?)])?;
     assert_eq!(get_vec(&db, &plain, b"k")?.as_deref(), Some(&b"v"[..]));
-    Ok(())
-}
-
-#[test]
-fn backup_of_a_vault_database_is_refused() -> TestResult {
-    let dir = TempDir::new()?;
-    populated(dir.path())?;
-    let db = open_vault(dir.path())?;
-    let target = dir.path().join("backup");
-    assert!(
-        db.backup(&target).is_err(),
-        "backup would drop the vault marker"
-    );
-    assert!(!target.exists(), "no half-made backup is left behind");
     Ok(())
 }

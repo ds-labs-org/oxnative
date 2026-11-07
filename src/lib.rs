@@ -297,6 +297,17 @@ impl Db {
         Ok(SstFileWriter(sst::Writer::create(path)?))
     }
 
+    /// Creates a writer for a sorted file meant for `column_family`. For a
+    /// vault column family the values are sealed in the file, which then only
+    /// loads into that column family of a database with the same key.
+    pub fn new_sst_file_for(
+        &self,
+        _column_family: &ColumnFamily,
+    ) -> Result<SstFileWriter, KvError> {
+        // RED stub (#7): behaves like `new_sst_file`, so values stay plaintext.
+        self.new_sst_file()
+    }
+
     /// Atomically adds files produced by [`SstFileWriter::finish`] to the
     /// given column families. An empty list is a no-op. The files are left in
     /// place; the caller deletes them.
