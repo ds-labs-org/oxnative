@@ -1,12 +1,6 @@
 //! Encrypted-at-rest column families (feature `vault`).
 
-// The primitives are wired into the database by the next vault tasks.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the database by the next vault tasks")
-)]
-
-use crate::KvError;
+use crate::{KvError, META_KEYSPACE, VAULT_CHECK_KEY};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload};
 use chacha20poly1305::{AeadCore, Key, XChaCha20Poly1305, XNonce};
 use std::fmt;
@@ -81,6 +75,24 @@ pub struct VaultOptions {
     pub key: VaultKey,
     /// Names of the column families whose values are encrypted.
     pub vault_column_families: Vec<&'static str>,
+}
+
+const CHECK_PLAINTEXT: &[u8] = b"oxnative vault key check";
+
+/// Builds the value stored to recognize the key at the next open: a sealed
+/// constant, bound to its location, so it differs on every database.
+pub(crate) fn new_check(key: &VaultKey) -> Result<Vec<u8>, KvError> {
+    seal(key, META_KEYSPACE, VAULT_CHECK_KEY, CHECK_PLAINTEXT)
+}
+
+/// Checks `key` against a stored key check.
+pub(crate) fn verify_check(key: &VaultKey, stored: &[u8]) -> Result<(), KvError> {
+    match open(key, META_KEYSPACE, VAULT_CHECK_KEY, stored) {
+        Ok(plaintext) if plaintext == CHECK_PLAINTEXT => Ok(()),
+        _ => Err(KvError::other(
+            "wrong vault key, or the vault key check is damaged",
+        )),
+    }
 }
 
 /// Associated data binding a value to its column family and record key. The

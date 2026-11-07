@@ -27,6 +27,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// File identifying an oxnative database directory.
 const MARKER_FILE: &str = "OXNATIVE";
 const MARKER_CONTENT: &str = "oxnative 1\nengine fjall 3\n";
+/// Marker line added to databases whose vault column families are encrypted.
+const MARKER_VAULT_LINE: &str = "vault 1";
+/// Prefix of every marker line that describes the vault format.
+const MARKER_VAULT_PREFIX: &str = "vault ";
 /// Subdirectory holding the fjall database.
 const FJALL_DIR: &str = "fjall";
 /// Subdirectory holding bulk-load files until they are ingested.
@@ -37,6 +41,13 @@ const META_KEYSPACE: &str = "_oxnative_meta";
 const DEFAULT_COLUMN_FAMILY: &str = "default";
 /// Key of the in-progress bulk load record in [`META_KEYSPACE`].
 const BULK_LOAD_KEY: &[u8] = b"bulk_load";
+/// Key of the vault key check in [`META_KEYSPACE`]. Only vaulted databases
+/// have it.
+const VAULT_CHECK_KEY: &[u8] = b"vault_check";
+
+/// Without the `vault` feature no database can be opened as vaulted.
+#[cfg(not(feature = "vault"))]
+enum VaultOptions {}
 
 /// Definition of a column family, given when opening the database.
 ///
@@ -107,7 +118,8 @@ impl Db {
         column_families: Vec<ColumnFamilyDefinition>,
         db_options: DbOptions,
     ) -> Result<Self, KvError> {
-        prepare_root(path)?;
+        let vault = db_options_vault(&db_options);
+        let created = prepare_root(path, vault.is_some())?;
         let mut builder = fjall::Database::builder(path.join(FJALL_DIR));
         if let Some(max_open_files) = db_options
             .max_open_files
@@ -117,6 +129,7 @@ impl Db {
             builder = builder.max_cached_files(Some(max_open_files));
         }
         let db = builder.open()?;
+        verify_vault_state(&db, vault, created)?;
         let inner = DbInner::new(db, &column_families, path, true, None)?;
         inner.recover_bulk_load()?;
         Ok(Self {
@@ -138,7 +151,30 @@ impl Db {
         path: &Path,
         column_families: Vec<ColumnFamilyDefinition>,
     ) -> Result<Self, KvError> {
-        check_marker(path)?;
+        Self::open_read_only_inner(path, &column_families, None)
+    }
+
+    /// Opens an existing vaulted database at `path` in read-only mode. The key
+    /// in `vault` is required and checked, as for [`Db::open_read_write`].
+    #[cfg(feature = "vault")]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "same shape as the other open functions"
+    )]
+    pub fn open_read_only_with_vault(
+        path: &Path,
+        column_families: Vec<ColumnFamilyDefinition>,
+        vault: VaultOptions,
+    ) -> Result<Self, KvError> {
+        Self::open_read_only_inner(path, &column_families, Some(&vault))
+    }
+
+    fn open_read_only_inner(
+        path: &Path,
+        column_families: &[ColumnFamilyDefinition],
+        vault: Option<&VaultOptions>,
+    ) -> Result<Self, KvError> {
+        check_marker(path, vault.is_some())?;
         let source = path.join(FJALL_DIR);
         if !source.is_dir() {
             return Err(KvError::corruption(format!(
@@ -148,21 +184,11 @@ impl Db {
         }
         let copy = PrivateCopy::create(&source, path)?;
         let db = fjall::Database::builder(copy.path()).open()?;
-        let inner = DbInner::new(db, &column_families, path, false, Some(copy))?;
+        verify_vault_state(&db, vault, false)?;
+        let inner = DbInner::new(db, column_families, path, false, Some(copy))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
-    }
-
-    /// Opens an existing vaulted database at `path` in read-only mode. The key
-    /// in `vault` is required and checked, as for [`Db::open_read_write`].
-    #[cfg(feature = "vault")]
-    pub fn open_read_only_with_vault(
-        _path: &Path,
-        _column_families: Vec<ColumnFamilyDefinition>,
-        _vault: VaultOptions,
-    ) -> Result<Self, KvError> {
-        Err(KvError::other("vault read-only open is not implemented"))
     }
 
     /// Whether this handle was opened with [`Db::open_read_write`].
@@ -498,7 +524,7 @@ impl DbInner {
     }
 
     fn backup_into(&self, target: &Path) -> Result<(), KvError> {
-        write_marker(target)?;
+        write_marker(target, false)?;
         #[expect(clippy::create_dir, reason = "the target was just created")]
         fs::create_dir(target.join(BULK_DIR))?;
         let target_db = fjall::Database::builder(target.join(FJALL_DIR)).open()?;
@@ -530,27 +556,32 @@ fn keyspace_options() -> KeyspaceCreateOptions {
 }
 
 /// Creates the database directory, or checks that an existing one belongs to
-/// this engine.
-fn prepare_root(path: &Path) -> Result<(), KvError> {
-    if path.join(MARKER_FILE).exists() {
-        check_marker(path)?;
+/// this engine. Returns whether the database is new.
+fn prepare_root(path: &Path, vault: bool) -> Result<bool, KvError> {
+    let created = if path.join(MARKER_FILE).exists() {
+        check_marker(path, vault)?;
+        false
     } else if !path.exists() {
         fs::create_dir_all(path)?;
-        write_marker(path)?;
+        write_marker(path, vault)?;
+        true
     } else if fs::read_dir(path)?.next().is_none() {
-        write_marker(path)?;
+        write_marker(path, vault)?;
+        true
     } else {
         return Err(KvError::corruption(format!(
             "{} is not an oxnative database (no {MARKER_FILE} file). Databases written by \
              the RocksDB backend must be migrated with a dump and a load.",
             path.display()
         )));
-    }
+    };
     fs::create_dir_all(path.join(BULK_DIR))?;
-    Ok(())
+    Ok(created)
 }
 
-fn check_marker(path: &Path) -> Result<(), KvError> {
+/// Checks the marker file, including that the vault flag matches how the
+/// database is being opened.
+fn check_marker(path: &Path, vault: bool) -> Result<(), KvError> {
     let content = fs::read_to_string(path.join(MARKER_FILE)).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             KvError::corruption(format!(
@@ -561,22 +592,98 @@ fn check_marker(path: &Path) -> Result<(), KvError> {
             e.into()
         }
     })?;
-    if content.lines().next() == MARKER_CONTENT.lines().next() {
-        Ok(())
-    } else {
-        Err(KvError::corruption(format!(
+    if content.lines().next() != MARKER_CONTENT.lines().next() {
+        return Err(KvError::corruption(format!(
             "unsupported oxnative database format in {}: {:?}",
             path.display(),
             content.lines().next().unwrap_or_default()
-        )))
+        )));
+    }
+    let mut marked_vault = false;
+    for line in content
+        .lines()
+        .filter(|l| l.starts_with(MARKER_VAULT_PREFIX))
+    {
+        if line == MARKER_VAULT_LINE {
+            marked_vault = true;
+        } else {
+            return Err(KvError::corruption(format!(
+                "unsupported vault format in {}: {line:?}",
+                path.display()
+            )));
+        }
+    }
+    match (marked_vault, vault) {
+        (true, false) => Err(KvError::other(format!(
+            "{} is a vaulted database: open it with a vault key (feature `vault`)",
+            path.display()
+        ))),
+        (false, true) => Err(KvError::other(format!(
+            "{} is not a vaulted database: a plain database is never converted to a vault \
+             one, as its plaintext values would stay on disk",
+            path.display()
+        ))),
+        _ => Ok(()),
     }
 }
 
-fn write_marker(path: &Path) -> Result<(), KvError> {
+fn write_marker(path: &Path, vault: bool) -> Result<(), KvError> {
     let mut file = fs::File::create_new(path.join(MARKER_FILE))?;
     file.write_all(MARKER_CONTENT.as_bytes())?;
+    if vault {
+        writeln!(file, "{MARKER_VAULT_LINE}")?;
+    }
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(feature = "vault")]
+fn db_options_vault(options: &DbOptions) -> Option<&VaultOptions> {
+    options.vault.as_ref()
+}
+
+#[cfg(not(feature = "vault"))]
+fn db_options_vault(_options: &DbOptions) -> Option<&VaultOptions> {
+    None
+}
+
+/// Fails closed unless the stored key check agrees with how the database is
+/// opened. A new vaulted database gets its key check here, before any data.
+#[cfg_attr(
+    not(feature = "vault"),
+    expect(unused_variables, reason = "only new vaulted databases need it")
+)]
+fn verify_vault_state(
+    db: &fjall::Database,
+    vault: Option<&VaultOptions>,
+    created: bool,
+) -> Result<(), KvError> {
+    let meta = db.keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let stored = meta.get(VAULT_CHECK_KEY)?;
+    let Some(vault) = vault else {
+        return if stored.is_some() {
+            Err(KvError::corruption(
+                "this database has a vault key check but is opened without a vault key",
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    #[cfg(feature = "vault")]
+    {
+        match stored {
+            Some(stored) => vault::verify_check(&vault.key, &stored),
+            None if created => {
+                meta.insert(VAULT_CHECK_KEY, vault::new_check(&vault.key)?)?;
+                Ok(db.persist(PersistMode::SyncAll)?)
+            }
+            None => Err(KvError::corruption("the vault key check is missing")),
+        }
+    }
+    #[cfg(not(feature = "vault"))]
+    {
+        match *vault {}
+    }
 }
 
 fn unique_suffix() -> String {
