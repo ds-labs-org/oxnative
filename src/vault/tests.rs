@@ -92,10 +92,12 @@ fn sealed_value_hides_plaintext_and_has_fixed_overhead() -> TestResult {
     let k = key(KEY_A);
     let plaintext = b"a very recognisable plaintext value";
     let sealed = seal(&k, "cf", b"key", plaintext)?;
-    assert!(
-        SEAL_OVERHEAD >= NONCE_LEN + TAG_LEN,
-        "overhead must hold at least the nonce and the tag"
-    );
+    const {
+        assert!(
+            SEAL_OVERHEAD >= NONCE_LEN + TAG_LEN,
+            "overhead must hold at least the nonce and the tag"
+        );
+    }
     assert_eq!(sealed.len(), plaintext.len() + SEAL_OVERHEAD);
     assert!(
         !sealed.windows(plaintext.len()).any(|w| w == plaintext),

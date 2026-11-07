@@ -1,11 +1,28 @@
 //! Encrypted-at-rest column families (feature `vault`).
 
+// The primitives are wired into the database by the next vault tasks.
+#![cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the database by the next vault tasks")
+)]
+
 use crate::KvError;
+use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload};
+use chacha20poly1305::{AeadCore, Key, XChaCha20Poly1305, XNonce};
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Bytes added to a plaintext value by [`seal`].
-pub(crate) const SEAL_OVERHEAD: usize = 0;
+const FORMAT_VERSION: u8 = 1;
+/// Identifies the key that sealed a value. Always 0 for now, reserved so that
+/// key rotation can be added without changing the sealed format.
+const KEY_ID: u8 = 0;
+const HEADER_LEN: usize = 2;
+const NONCE_LEN: usize = 24;
+const TAG_LEN: usize = 16;
+
+/// Bytes added to a plaintext value by [`seal`]: header (format version and
+/// key id), nonce and authentication tag.
+pub(crate) const SEAL_OVERHEAD: usize = HEADER_LEN + NONCE_LEN + TAG_LEN;
 
 /// A 32-byte encryption key, zeroized on drop.
 #[derive(Clone)]
@@ -23,9 +40,16 @@ impl VaultKey {
     }
 }
 
-// Red step stubs: the real impls zeroize the bytes
 impl Zeroize for VaultKey {
-    fn zeroize(&mut self) {}
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Drop for VaultKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 impl ZeroizeOnDrop for VaultKey {}
@@ -33,15 +57,20 @@ impl ZeroizeOnDrop for VaultKey {}
 impl TryFrom<&[u8]> for VaultKey {
     type Error = KvError;
 
-    #[expect(clippy::unimplemented, reason = "red step stub")]
-    fn try_from(_bytes: &[u8]) -> Result<Self, KvError> {
-        unimplemented!("VaultKey::try_from")
+    fn try_from(bytes: &[u8]) -> Result<Self, KvError> {
+        let key = <[u8; 32]>::try_from(bytes).map_err(|_| {
+            KvError::other(format!(
+                "a vault key must be exactly 32 bytes, got {}",
+                bytes.len()
+            ))
+        })?;
+        Ok(Self(key))
     }
 }
 
 impl fmt::Debug for VaultKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "VaultKey({:?})", self.0)
+        f.write_str("VaultKey(<redacted>)")
     }
 }
 
@@ -54,24 +83,80 @@ pub struct VaultOptions {
     pub vault_column_families: Vec<&'static str>,
 }
 
-#[expect(clippy::unimplemented, reason = "red step stub")]
-pub(crate) fn seal(
-    _key: &VaultKey,
-    _column_family: &str,
-    _record_key: &[u8],
-    _plaintext: &[u8],
+/// Associated data binding a value to its column family and record key. The
+/// column family length prefix keeps the encoding unambiguous.
+fn associated_data(
+    header: [u8; HEADER_LEN],
+    column_family: &str,
+    record_key: &[u8],
 ) -> Result<Vec<u8>, KvError> {
-    unimplemented!("seal")
+    let cf_len = u64::try_from(column_family.len())
+        .map_err(|_| KvError::other("column family name too long"))?;
+    let mut aad = Vec::with_capacity(HEADER_LEN + 8 + column_family.len() + record_key.len());
+    aad.extend_from_slice(&header);
+    aad.extend_from_slice(&cf_len.to_le_bytes());
+    aad.extend_from_slice(column_family.as_bytes());
+    aad.extend_from_slice(record_key);
+    Ok(aad)
 }
 
-#[expect(clippy::unimplemented, reason = "red step stub")]
-pub(crate) fn open(
-    _key: &VaultKey,
-    _column_family: &str,
-    _record_key: &[u8],
-    _sealed: &[u8],
+/// Encrypts `plaintext` as `header || nonce || ciphertext || tag` with a fresh
+/// random nonce.
+pub(crate) fn seal(
+    key: &VaultKey,
+    column_family: &str,
+    record_key: &[u8],
+    plaintext: &[u8],
 ) -> Result<Vec<u8>, KvError> {
-    unimplemented!("open")
+    let header = [FORMAT_VERSION, KEY_ID];
+    let aad = associated_data(header, column_family, record_key)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_bytes()));
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| KvError::other("vault encryption failed"))?;
+    let mut sealed = Vec::with_capacity(HEADER_LEN + NONCE_LEN + ciphertext.len());
+    sealed.extend_from_slice(&header);
+    sealed.extend_from_slice(&nonce);
+    sealed.extend_from_slice(&ciphertext);
+    Ok(sealed)
+}
+
+/// Decrypts a value produced by [`seal`]. Any failure (wrong key, tampering,
+/// wrong location, malformed input) is reported as corruption.
+pub(crate) fn open(
+    key: &VaultKey,
+    column_family: &str,
+    record_key: &[u8],
+    sealed: &[u8],
+) -> Result<Vec<u8>, KvError> {
+    let corrupt = || KvError::corruption("vault value cannot be decrypted");
+    if sealed.len() < SEAL_OVERHEAD {
+        return Err(corrupt());
+    }
+    let (header, rest) = sealed.split_at(HEADER_LEN);
+    let header = <[u8; HEADER_LEN]>::try_from(header).map_err(|_| corrupt())?;
+    if header != [FORMAT_VERSION, KEY_ID] {
+        return Err(corrupt());
+    }
+    let (nonce, ciphertext) = rest.split_at(NONCE_LEN);
+    let aad = associated_data(header, column_family, record_key)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_bytes()));
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| corrupt())
 }
 
 #[cfg(test)]
