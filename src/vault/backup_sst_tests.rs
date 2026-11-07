@@ -284,7 +284,9 @@ fn backup_carries_the_vault_marker_and_key_check() -> TestResult {
     );
     let check = raw_get(&target, META_KEYSPACE, VAULT_CHECK_KEY)?
         .ok_or("the backup has no vault key check")?;
-    verify_check(&VaultKey::new(KEY_A), &check)?;
+    let cfs = raw_get(&target, META_KEYSPACE, crate::VAULT_CFS_KEY)?
+        .ok_or("the backup has no vault column family set")?;
+    verify_check(&VaultKey::new(KEY_A), &cfs, &check)?;
     Ok(())
 }
 
@@ -500,7 +502,8 @@ fn plain_file_format_is_identical_for_new_sst_file_and_for_a_plain_cf() -> TestR
     let dir = TempDir::new()?;
     let db = open_vault(dir.path())?;
     let plain = db.column_family(PLAIN)?;
-    let mut old = db.new_sst_file()?;
+    let plain_dir = TempDir::new()?;
+    let mut old = open_plain(plain_dir.path())?.new_sst_file()?;
     old.insert(b"k", PLAIN_VALUE)?;
     let mut new = db.new_sst_file_for(&plain)?;
     new.insert(b"k", PLAIN_VALUE)?;
@@ -666,7 +669,8 @@ fn unsealed_file_is_refused_in_a_vault_cf() -> TestResult {
     let dir = TempDir::new()?;
     let db = open_vault(dir.path())?;
     let secret = db.column_family(SECRET)?;
-    let mut file = db.new_sst_file()?;
+    let plain = db.column_family(PLAIN)?;
+    let mut file = db.new_sst_file_for(&plain)?;
     file.insert(b"k", SECRET_VALUE)?;
     let result = db.insert_stt_files(&[(secret.clone(), file.finish()?)]);
     assert!(result.is_err(), "plain values must never enter a vault CF");
@@ -823,5 +827,35 @@ fn sealed_files_load_and_read_through_a_read_only_vault_handle() -> TestResult {
         reader.new_sst_file_for(&secret).is_err(),
         "a read-only handle cannot create bulk-load files"
     );
+    Ok(())
+}
+
+#[test]
+fn new_sst_file_is_refused_on_a_vault_database_and_writes_nothing() -> TestResult {
+    let dir = TempDir::new()?;
+    let db = open_vault(dir.path())?;
+    assert!(
+        db.new_sst_file().is_err(),
+        "the plain writer must not run on a vault database"
+    );
+    assert_eq!(file_count(&dir.path().join("bulk"))?, 0);
+    Ok(())
+}
+
+#[test]
+fn new_sst_file_still_works_when_no_cf_is_vaulted() -> TestResult {
+    let dir = TempDir::new()?;
+    let db = Db::open_read_write(
+        dir.path(),
+        definitions(),
+        DbOptions {
+            vault: Some(VaultOptions {
+                key: VaultKey::new(KEY_A),
+                vault_column_families: vec![],
+            }),
+            ..DbOptions::default()
+        },
+    )?;
+    drop(db.new_sst_file()?);
     Ok(())
 }

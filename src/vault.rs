@@ -105,15 +105,48 @@ impl Seal {
 
 const CHECK_PLAINTEXT: &[u8] = b"oxnative vault key check";
 
-/// Builds the value stored to recognize the key at the next open: a sealed
-/// constant, bound to its location, so it differs on every database.
-pub(crate) fn new_check(key: &VaultKey) -> Result<Vec<u8>, KvError> {
-    seal(key, META_KEYSPACE, VAULT_CHECK_KEY, CHECK_PLAINTEXT)
+/// Canonical encoding of a set of vault column family names: sorted, without
+/// duplicates, each name prefixed by its length.
+pub(crate) fn encode_column_families(names: &[&str]) -> Result<Vec<u8>, KvError> {
+    let mut sorted = names.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut encoded = Vec::new();
+    for name in sorted {
+        let len = u8::try_from(name.len())
+            .map_err(|_| KvError::other(format!("column family name {name:?} too long")))?;
+        encoded.push(len);
+        encoded.extend_from_slice(name.as_bytes());
+    }
+    Ok(encoded)
 }
 
-/// Checks `key` against a stored key check.
-pub(crate) fn verify_check(key: &VaultKey, stored: &[u8]) -> Result<(), KvError> {
-    match open(key, META_KEYSPACE, VAULT_CHECK_KEY, stored) {
+/// Location of the key check, which binds it to the vault column family set.
+fn check_location(column_families: &[u8]) -> Vec<u8> {
+    let mut location = VAULT_CHECK_KEY.to_vec();
+    location.extend_from_slice(column_families);
+    location
+}
+
+/// Builds the value stored to recognize the key at the next open: a sealed
+/// constant, bound to its location and to the encoded vault column family set,
+/// so it differs on every database.
+pub(crate) fn new_check(key: &VaultKey, column_families: &[u8]) -> Result<Vec<u8>, KvError> {
+    seal(
+        key,
+        META_KEYSPACE,
+        &check_location(column_families),
+        CHECK_PLAINTEXT,
+    )
+}
+
+/// Checks `key` against a stored key check for the stored column family set.
+pub(crate) fn verify_check(
+    key: &VaultKey,
+    column_families: &[u8],
+    stored: &[u8],
+) -> Result<(), KvError> {
+    match open(key, META_KEYSPACE, &check_location(column_families), stored) {
         Ok(plaintext) if plaintext == CHECK_PLAINTEXT => Ok(()),
         _ => Err(KvError::other(
             "wrong vault key, or the vault key check is damaged",

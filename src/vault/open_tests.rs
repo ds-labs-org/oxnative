@@ -395,3 +395,72 @@ fn missing_key_check_with_data_still_fails_closed() -> TestResult {
     assert!(open_vault(dir.path(), KEY_B).is_err());
     Ok(())
 }
+
+// --- the vault column family set is persisted and checked (#3 final review) ---
+
+fn open_vault_with_set(
+    path: &Path,
+    key: [u8; 32],
+    vault_column_families: Vec<&'static str>,
+) -> Result<Db, KvError> {
+    Db::open_read_write(
+        path,
+        definitions(),
+        DbOptions {
+            vault: Some(VaultOptions {
+                key: VaultKey::new(key),
+                vault_column_families,
+            }),
+            ..DbOptions::default()
+        },
+    )
+}
+
+#[test]
+fn reopening_with_an_omitted_vault_cf_is_refused() -> TestResult {
+    let dir = TempDir::new()?;
+    {
+        let db = open_vault(dir.path(), KEY_A)?;
+        db.insert(&db.column_family("secret")?, b"k", b"v")?;
+        db.flush()?;
+    }
+    assert!(open_vault_with_set(dir.path(), KEY_A, vec![]).is_err());
+    assert!(open_vault_with_set(dir.path(), KEY_A, vec!["secret", "plain"]).is_err());
+    let read_only = Db::open_read_only_with_vault(
+        dir.path(),
+        definitions(),
+        VaultOptions {
+            key: VaultKey::new(KEY_A),
+            vault_column_families: vec![],
+        },
+    );
+    assert!(read_only.is_err());
+    drop(open_vault(dir.path(), KEY_A)?);
+    Ok(())
+}
+
+#[test]
+fn vault_cf_order_and_duplicates_do_not_matter() -> TestResult {
+    let dir = TempDir::new()?;
+    drop(open_vault_with_set(
+        dir.path(),
+        KEY_A,
+        vec!["secret", "plain"],
+    )?);
+    drop(open_vault_with_set(
+        dir.path(),
+        KEY_A,
+        vec!["plain", "secret", "plain"],
+    )?);
+    Ok(())
+}
+
+#[test]
+fn backup_keeps_the_vault_cf_set() -> TestResult {
+    let dir = TempDir::new()?;
+    let target = dir.path().join("backup");
+    open_vault(&dir.path().join("db"), KEY_A)?.backup(&target)?;
+    assert!(open_vault_with_set(&target, KEY_A, vec![]).is_err());
+    drop(open_vault(&target, KEY_A)?);
+    Ok(())
+}

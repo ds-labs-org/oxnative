@@ -45,6 +45,9 @@ const BULK_LOAD_KEY: &[u8] = b"bulk_load";
 /// Key of the vault key check in [`META_KEYSPACE`]. Only vaulted databases
 /// have it.
 const VAULT_CHECK_KEY: &[u8] = b"vault_check";
+/// Key of the encoded vault column family set in [`META_KEYSPACE`]. Written
+/// with the key check, which it is bound to.
+const VAULT_CFS_KEY: &[u8] = b"vault_cfs";
 
 /// Without the `vault` feature no database can be opened as vaulted.
 #[cfg(not(feature = "vault"))]
@@ -287,7 +290,21 @@ impl Db {
     /// Creates a writer for a sorted file, written outside the database and
     /// added later with [`Db::insert_stt_files`]. Keys are inserted in strictly
     /// increasing order.
+    ///
+    /// Fails on a database with vault column families, as the file would hold
+    /// plaintext values: use [`Db::new_sst_file_for`].
     pub fn new_sst_file(&self) -> Result<SstFileWriter, KvError> {
+        self.inner.check_writable("Bulk-load file creation")?;
+        if self.inner.has_vault_column_families() {
+            return Err(KvError::other(
+                "new_sst_file writes plaintext: use new_sst_file_for on a database with vault \
+                 column families",
+            ));
+        }
+        self.new_plain_sst_file()
+    }
+
+    fn new_plain_sst_file(&self) -> Result<SstFileWriter, KvError> {
         self.inner.check_writable("Bulk-load file creation")?;
         let path = self
             .inner
@@ -320,7 +337,7 @@ impl Db {
                 Box::new(move |key, value| seal.seal(key, value)),
             )?));
         }
-        self.new_sst_file()
+        self.new_plain_sst_file()
     }
 
     /// Atomically adds files produced by [`SstFileWriter::finish`] to the
@@ -447,6 +464,17 @@ impl DbInner {
             visibility: RwLock::new(()),
             copy,
         })
+    }
+
+    #[cfg(feature = "vault")]
+    fn has_vault_column_families(&self) -> bool {
+        self.column_families.iter().any(|(_, cf)| cf.seal.is_some())
+    }
+
+    #[cfg(not(feature = "vault"))]
+    #[expect(clippy::unused_self, reason = "same signature as with `vault`")]
+    fn has_vault_column_families(&self) -> bool {
+        false
     }
 
     fn check_writable(&self, operation: &str) -> Result<(), KvError> {
@@ -598,6 +626,7 @@ impl DbInner {
         // Vault values are copied as stored, still sealed, and the backup keeps
         // the vault marker and key check so that it opens like the source.
         let check = self.meta.get(VAULT_CHECK_KEY)?;
+        let vault_cfs = self.meta.get(VAULT_CFS_KEY)?;
         write_marker(target, check.is_some())?;
         #[expect(clippy::create_dir, reason = "the target was just created")]
         fs::create_dir(target.join(BULK_DIR))?;
@@ -605,6 +634,9 @@ impl DbInner {
         if let Some(check) = check {
             let meta = target_db.keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)?;
             meta.insert(VAULT_CHECK_KEY, check)?;
+            if let Some(vault_cfs) = vault_cfs {
+                meta.insert(VAULT_CFS_KEY, vault_cfs)?;
+            }
         }
         let snapshot = self.snapshot();
         for (name, cf) in &self.column_families {
@@ -749,10 +781,25 @@ fn verify_vault_state(
     };
     #[cfg(feature = "vault")]
     {
+        let wanted = vault::encode_column_families(&vault.vault_column_families)?;
         match stored {
-            Some(stored) => vault::verify_check(&vault.key, &stored),
+            Some(stored) => {
+                let recorded = meta
+                    .get(VAULT_CFS_KEY)?
+                    .ok_or_else(|| KvError::corruption("the vault column family set is missing"))?;
+                vault::verify_check(&vault.key, &recorded, &stored)?;
+                if *recorded == *wanted {
+                    Ok(())
+                } else {
+                    Err(KvError::other(
+                        "the vault column families differ from those the database was created \
+                         with",
+                    ))
+                }
+            }
             None if created || is_empty_database(db)? => {
-                meta.insert(VAULT_CHECK_KEY, vault::new_check(&vault.key)?)?;
+                meta.insert(VAULT_CFS_KEY, wanted.as_slice())?;
+                meta.insert(VAULT_CHECK_KEY, vault::new_check(&vault.key, &wanted)?)?;
                 Ok(db.persist(PersistMode::SyncAll)?)
             }
             None => Err(KvError::corruption("the vault key check is missing")),

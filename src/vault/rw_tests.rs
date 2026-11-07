@@ -628,7 +628,7 @@ fn bulk_load_into_a_vault_cf_is_refused_and_leaves_no_plaintext() -> TestResult 
     let db = open_vault(dir.path())?;
     let secret = db.column_family(SECRET)?;
     let plain = db.column_family(PLAIN)?;
-    let mut file = db.new_sst_file()?;
+    let mut file = db.new_sst_file_for(&plain)?;
     file.insert(b"k", VALUE)?;
     let path = file.finish()?;
     let result = db.insert_stt_files(&[(plain.clone(), path.clone()), (secret.clone(), path)]);
@@ -657,7 +657,7 @@ fn bulk_load_into_a_plain_cf_of_a_vault_database_still_works() -> TestResult {
     let dir = TempDir::new()?;
     let db = open_vault(dir.path())?;
     let plain = db.column_family(PLAIN)?;
-    let mut file = db.new_sst_file()?;
+    let mut file = db.new_sst_file_for(&plain)?;
     file.insert(b"k", b"v")?;
     db.insert_stt_files(&[(plain.clone(), file.finish()?)])?;
     assert_eq!(get_vec(&db, &plain, b"k")?.as_deref(), Some(&b"v"[..]));

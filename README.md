@@ -176,7 +176,8 @@ let db = Db::open_read_write(
 the feature off the `vault` field does not exist. `Db::open_read_only` on a
 vaulted database, and `Db::open_read_write` without `vault` on one, fail.
 For bulk loads of a vault column family use `new_sst_file_for(&cf)`: a file
-from `new_sst_file()` is refused by `insert_stt_files` for those.
+from `new_sst_file()` would hold plaintext, so it fails on a database with vault
+column families (and `insert_stt_files` refuses such files for them).
 
 ### On-disk format
 
@@ -189,7 +190,9 @@ from `new_sst_file()` is refused by `insert_stt_files` for those.
 - Associated data: `format version || key id || len(column family) as u64 LE
   || column family name || record key`.
 - `_oxnative_meta` holds `vault_check`, a sealed constant bound to its location,
-  which tells a wrong key from a right one without reading user data.
+  which tells a wrong key from a right one without reading user data, and
+  `vault_cfs`, the sorted set of vault column families the check is bound to. An
+  open whose set differs is refused.
 - Bulk-load files of a vault column family carry sealed values and the column
   family name.
 
