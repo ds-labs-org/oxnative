@@ -107,8 +107,9 @@ cargo test --features vault
 
 Protected: an attacker who obtains the database directory, a `backup()` of it
 or a bulk-load file (disk theft, stolen backup, shared snapshot) without the
-key cannot read the **values** of the vault column families, and cannot
-modify, swap or roll back individual values without detection.
+key cannot read the **values** of the vault column families, and cannot forge
+or alter a value, or move one to another key or column family, without
+detection. Authenticity is per value only (see "Integrity" below).
 
 Not protected:
 
@@ -121,8 +122,17 @@ Not protected:
 - A running process: the key and the decrypted values are in its memory, and
   anyone who can read it or call the API has the data. Every `VaultKey` is
   zeroized when dropped, which is best effort.
-- Whole-database rollback: restoring an older copy of the directory is valid.
-  AEAD binds a value to its column family and key, not to a version.
+- Integrity is limited to the pair (column family name, record key). The
+  associated data does not contain a version, a database identifier or any
+  other context, so:
+  - a value can be **replayed**: an older sealed value copied back under its
+    own key and column family opens without error, and returns stale data;
+  - sealed bytes can be transplanted between databases that share a key: a
+    sealed value copied from one database into the same column family and key
+    of another database with the same key is accepted;
+  - restoring an older copy of the whole directory is valid, for the same
+    reason.
+  Use a distinct key per database to rule out transplants.
 - Key management: this crate takes the 32 bytes and nothing else. Where the key
   is stored, how it is derived and who may read it is the caller's business.
 
@@ -132,7 +142,8 @@ Not protected:
   value.
 - Only values are encrypted. The associated data is the column family name and
   the record key, so a sealed value copied under another key or into another
-  column family fails to open.
+  column family fails to open. It does not bind a version or a database, see
+  the threat model.
 - Fail closed: a missing key, a wrong key (checked at open with a sealed key
   check stored in `_oxnative_meta`), a damaged value or a vault column family
   name that is not among the column families all return an error. Nothing is
@@ -142,7 +153,8 @@ Not protected:
   plain database is never converted, and a vaulted one cannot be opened
   without its key (nor by a build without the feature).
 - `Db::backup` copies vault values as stored, still sealed, and the backup
-  opens with the same key. `Db::new_sst_file_for` seals the values of a bulk
+  opens with the same key, through `Db::open_read_write_with_vault` or
+  `Db::open_read_only_with_vault` (the plain `open_*` functions refuse it). `Db::new_sst_file_for` seals the values of a bulk
   file of a vault column family; such a file only loads into that column
   family of a database with the same key.
 - No rotation yet: the sealed format reserves a key id, so it can be added
@@ -179,8 +191,19 @@ column families (and `insert_stt_files` refuses such files for them).
 
 ### On-disk format
 
-- `OXNATIVE` marker: the usual two lines, plus a third line `vault 1` for a
-  vaulted database. A build that does not know the line refuses to open it.
+- `OXNATIVE` marker of a vaulted database, written by the current version:
+
+  ```text
+  oxnative 2
+  engine fjall 3
+  vault 1
+  ```
+
+  The first line differs from the `oxnative 1` of plain databases, so builds
+  without vault support, which only compare the first line, refuse to open it.
+  Vaulted databases created earlier with `oxnative 1` as first line (and a
+  `vault 1` line) still open; a `vault` line with another version is refused.
+  A plain database keeps the two-line marker `oxnative 1` / `engine fjall 3`.
 - Each stored value of a vault column family is
   `format version (1 byte, 1) || key id (1 byte, 0) || nonce (24) || ciphertext || tag (16)`:
   42 bytes of overhead. Values are not compressible after encryption, so the
@@ -196,16 +219,32 @@ column families (and `insert_stt_files` refuses such files for them).
 
 ### Using it from the Oxigraph fork
 
-Vault the column families whose values hold the sensitive content and whose
-keys do not: **`id2str`** (the dictionary from the 128-bit hash to the string
-of every IRI, blank node and literal). Its key is a hash, so nothing is lost
-by leaving it plaintext, and every term of every triple lives there.
+Vaulting **`id2str`** (the dictionary from the 128-bit hash to the string of
+every IRI, blank node and literal) alone protects much less than it seems:
 
-The six index column families (`spog`, `posg`, `ospg`, `gspo`, `gpos`, `gosp`, `dspo`, `dpos`, `dosp`) keep the
-encoded terms in their keys and have empty values, so vaulting them protects
-nothing; the term ids are hashes, which only leak equality and the graph
-structure. Leave them, and `default`/`graphs`, plain unless the graph names
-themselves are secret (the `graphs` keys are the encoded graph names).
+- The fork stores terms of at most 15 bytes inline in the encoded terms, hence
+  in the plaintext keys of the index column families, and never writes them to
+  `id2str`. Short IRIs, short strings, and all numeric, boolean, date, time and
+  duration literals are therefore in clear text in the index keys. Only terms
+  over 15 bytes reach `id2str`.
+- For those, the key of the other terms is a hash, `StrHash`, which is plain
+  unkeyed SipHash-2-4. Anyone with the database can hash a guessed value (a
+  known IRI, a name, an e-mail address) and look for the hash in the index
+  keys: equality of guessable values is confirmable, vaulted or not. Only long
+  values that cannot be guessed are really protected.
+- The structure of the graph (which hashes occur together, in which graphs)
+  stays visible.
+
+Real protection of term contents needs changes in the fork, not only vaulting:
+no inlining (every term goes through `id2str`), and a keyed hash for `StrHash`
+derived from the vault key instead of the unkeyed SipHash. Without them, treat
+the vault as protecting long, unguessable terms only.
+
+The nine index column families (`spog`, `posg`, `ospg`, `gspo`, `gpos`, `gosp`,
+`dspo`, `dpos`, `dosp`) keep the encoded terms in their keys and have empty
+values, so vaulting them protects nothing. Leave them, and `default`/`graphs`,
+plain unless the graph names themselves are secret (the `graphs` keys are the
+encoded graph names, also plaintext).
 
 In the fork, in `oxnative_wrapper.rs`, call `Db::open_read_write_with_vault` and
 `Db::open_read_only_with_vault` for read-only handles; `Store::open` and

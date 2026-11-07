@@ -410,7 +410,10 @@ impl Db {
 
     /// Writes a consistent copy of the database into `target_directory`, which
     /// must not exist yet. The copy can be opened with [`Db::open_read_write`]
-    /// and [`Db::open_read_only`].
+    /// and [`Db::open_read_only`]. A backup of a vaulted database is still
+    /// sealed and only opens with the same key, through
+    /// `Db::open_read_write_with_vault` or `Db::open_read_only_with_vault`
+    /// (feature `vault`); the plain open functions refuse it.
     ///
     /// The copy is logical (every key is rewritten), so it takes time and space
     /// proportional to the database size.
