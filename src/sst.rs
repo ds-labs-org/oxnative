@@ -102,6 +102,7 @@ fn write_chunk(file: &mut impl Write, chunk: &[u8]) -> io::Result<()> {
 
 struct Reader {
     file: BufReader<File>,
+    last_key: Option<Vec<u8>>,
 }
 
 impl Reader {
@@ -111,7 +112,10 @@ impl Reader {
         let mut file = BufReader::new(File::open(path)?);
         let mut magic = [0; MAGIC.len()];
         file.read_exact(&mut magic)?;
-        let mut reader = Self { file };
+        let mut reader = Self {
+            file,
+            last_key: None,
+        };
         match (&magic, sealed_for) {
             (m, None) if m == MAGIC => {}
             (m, Some(column_family)) if m == SEALED_MAGIC => {
@@ -152,6 +156,18 @@ impl Reader {
         let key = self.read_chunk(len)?;
         self.file.read_exact(&mut len)?;
         let value = self.read_chunk(len)?;
+        // Ingestion requires strictly increasing keys: a tampered file must be
+        // refused here rather than make it panic
+        if self
+            .last_key
+            .as_deref()
+            .is_some_and(|last| last >= key.as_slice())
+        {
+            return Err(KvError::corruption(
+                "keys of a bulk-load file are not in strictly increasing order",
+            ));
+        }
+        self.last_key = Some(key.clone());
         Ok(Some((key, value)))
     }
 
@@ -165,13 +181,16 @@ impl Reader {
 }
 
 /// Checks the files before any ingestion: that they are of the right kind
-/// and, for a vault column family (`sealed` holds its name and the function
-/// opening a value), that every sealed value opens.
+/// that their keys are strictly increasing and, for a vault column family
+/// (`sealed` holds its name and the function opening a value), that every
+/// sealed value opens.
 pub fn verify(paths: &[PathBuf], sealed: Option<(&str, &OpenFn<'_>)>) -> Result<(), KvError> {
     for path in paths {
         let mut reader = Reader::open(path, sealed.map(|(name, _)| name))?;
-        if let Some((_, open)) = sealed {
-            while let Some((key, value)) = reader.next()? {
+        // Reads every record: checks key order for all files, and that every
+        // sealed value opens for sealed ones
+        while let Some((key, value)) = reader.next()? {
+            if let Some((_, open)) = sealed {
                 open(&key, &value)?;
             }
         }

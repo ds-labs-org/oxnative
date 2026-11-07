@@ -600,6 +600,10 @@ impl DbInner {
     }
 
     /// Completes a bulk load interrupted by a crash.
+    ///
+    /// The files are verified before any ingestion; a bad file (disordered,
+    /// tampered, unopenable) makes the open fail with an error, never a panic,
+    /// and leaves the record in place so that nothing is silently discarded.
     fn recover_bulk_load(&self) -> Result<(), KvError> {
         let Some(record) = self.meta.get(BULK_LOAD_KEY)? else {
             return Ok(());
