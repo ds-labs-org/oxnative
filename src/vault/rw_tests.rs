@@ -619,3 +619,61 @@ fn a_tampered_value_does_not_poison_other_keys_or_plain_cfs() -> TestResult {
     );
     Ok(())
 }
+
+// --- bulk loads and backups are refused on vaults until #7 ---
+
+#[test]
+fn bulk_load_into_a_vault_cf_is_refused_and_leaves_no_plaintext() -> TestResult {
+    let dir = TempDir::new()?;
+    let db = open_vault(dir.path())?;
+    let secret = db.column_family(SECRET)?;
+    let plain = db.column_family(PLAIN)?;
+    let mut file = db.new_sst_file()?;
+    file.insert(b"k", VALUE)?;
+    let path = file.finish()?;
+    let result = db.insert_stt_files(&[(plain.clone(), path.clone()), (secret.clone(), path)]);
+    assert!(
+        result.is_err(),
+        "bulk load into a vault CF must fail closed"
+    );
+    assert_eq!(get_vec(&db, &secret, b"k")?, None);
+    assert_eq!(
+        get_vec(&db, &plain, b"k")?,
+        None,
+        "a refused load is all or nothing"
+    );
+    db.flush()?;
+    drop((db, secret, plain));
+    let reopened = open_vault(dir.path())?;
+    assert_eq!(
+        get_vec(&reopened, &reopened.column_family(SECRET)?, b"k")?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn bulk_load_into_a_plain_cf_of_a_vault_database_still_works() -> TestResult {
+    let dir = TempDir::new()?;
+    let db = open_vault(dir.path())?;
+    let plain = db.column_family(PLAIN)?;
+    let mut file = db.new_sst_file()?;
+    file.insert(b"k", b"v")?;
+    db.insert_stt_files(&[(plain.clone(), file.finish()?)])?;
+    assert_eq!(get_vec(&db, &plain, b"k")?.as_deref(), Some(&b"v"[..]));
+    Ok(())
+}
+
+#[test]
+fn backup_of_a_vault_database_is_refused() -> TestResult {
+    let dir = TempDir::new()?;
+    populated(dir.path())?;
+    let db = open_vault(dir.path())?;
+    let target = dir.path().join("backup");
+    assert!(
+        db.backup(&target).is_err(),
+        "backup would drop the vault marker"
+    );
+    assert!(!target.exists(), "no half-made backup is left behind");
+    Ok(())
+}

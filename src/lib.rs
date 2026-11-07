@@ -309,6 +309,7 @@ impl Db {
         if ssts_for_cf.is_empty() {
             return Ok(());
         }
+        refuse_vault_bulk_load(ssts_for_cf.iter().map(|(cf, _)| cf))?;
         let mut by_cf = BTreeMap::<usize, (&ColumnFamily, Vec<PathBuf>)>::new();
         for (cf, path) in ssts_for_cf {
             by_cf
@@ -339,6 +340,18 @@ impl Db {
     /// The copy is logical (every key is rewritten), so it takes time and space
     /// proportional to the database size.
     pub fn backup(&self, target_directory: &Path) -> Result<(), KvError> {
+        // Until vault backups are supported (#7) the copy would lose the vault
+        // marker and key check, so it would open as a plain database.
+        if self
+            .inner
+            .column_families
+            .iter()
+            .any(|(_, cf)| cf.is_vault())
+        {
+            return Err(KvError::other(
+                "backup of a vaulted database is not supported yet",
+            ));
+        }
         #[expect(clippy::create_dir, reason = "the target must not exist yet")]
         fs::create_dir(target_directory)?;
         let result = self.inner.backup_into(target_directory);
@@ -539,6 +552,7 @@ impl DbInner {
                 .split_once('\t')
                 .ok_or_else(|| KvError::corruption("invalid bulk-load record"))?;
             let cf = self.column_family_named(name)?;
+            refuse_vault_bulk_load(std::iter::once(cf))?;
             by_cf
                 .entry(cf.index)
                 .or_insert_with(|| (cf, Vec::new()))
@@ -759,7 +773,31 @@ pub struct ColumnFamily {
     seal: Option<vault::Seal>,
 }
 
+/// Bulk-load files hold plain values, which a vault column family could not
+/// read back: refused until sealed bulk loads exist (#7).
+fn refuse_vault_bulk_load<'a>(
+    mut cfs: impl Iterator<Item = &'a ColumnFamily>,
+) -> Result<(), KvError> {
+    if cfs.any(ColumnFamily::is_vault) {
+        return Err(KvError::other(
+            "bulk loading into a vault column family is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
 impl ColumnFamily {
+    #[cfg(feature = "vault")]
+    fn is_vault(&self) -> bool {
+        self.seal.is_some()
+    }
+
+    #[cfg(not(feature = "vault"))]
+    #[expect(clippy::unused_self, reason = "same signature as with `vault`")]
+    fn is_vault(&self) -> bool {
+        false
+    }
+
     /// The bytes stored for `value`: encrypted in a vault column family.
     #[cfg(feature = "vault")]
     fn seal<'v>(&self, key: &[u8], value: &'v [u8]) -> Result<Cow<'v, [u8]>, KvError> {
