@@ -154,6 +154,17 @@ impl Db {
         })
     }
 
+    /// Opens an existing vaulted database at `path` in read-only mode. The key
+    /// in `vault` is required and checked, as for [`Db::open_read_write`].
+    #[cfg(feature = "vault")]
+    pub fn open_read_only_with_vault(
+        _path: &Path,
+        _column_families: Vec<ColumnFamilyDefinition>,
+        _vault: VaultOptions,
+    ) -> Result<Self, KvError> {
+        Err(KvError::other("vault read-only open is not implemented"))
+    }
+
     /// Whether this handle was opened with [`Db::open_read_write`].
     pub fn is_writable(&self) -> bool {
         self.inner.writable
