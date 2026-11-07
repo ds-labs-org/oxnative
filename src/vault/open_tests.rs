@@ -16,7 +16,9 @@ const KEY_A: [u8; 32] = [0x11; 32];
 const KEY_B: [u8; 32] = [0x22; 32];
 const MARKER_PATH: &str = "OXNATIVE";
 const PLAIN_MARKER: &str = "oxnative 1\nengine fjall 3\n";
-const VAULT_MARKER: &str = "oxnative 1\nengine fjall 3\nvault 1\n";
+const VAULT_MARKER: &str = "oxnative 2\nengine fjall 3\nvault 1\n";
+/// Marker written by vaulted databases before #11; they must keep opening.
+const LEGACY_VAULT_MARKER: &str = "oxnative 1\nengine fjall 3\nvault 1\n";
 
 fn definitions() -> Vec<ColumnFamilyDefinition> {
     ["plain", "secret"]
@@ -305,7 +307,7 @@ fn adding_the_vault_flag_to_a_plain_marker_is_refused() -> TestResult {
         transaction.insert(&plain, b"k", b"plain value");
         transaction.commit()?;
     }
-    fs::write(dir.path().join(MARKER_PATH), VAULT_MARKER)?;
+    fs::write(dir.path().join(MARKER_PATH), LEGACY_VAULT_MARKER)?;
     assert!(
         open_vault(dir.path(), KEY_A).is_err(),
         "no key check was ever stored: the database cannot be trusted as vaulted"
@@ -374,7 +376,7 @@ fn key_check_copied_from_another_database_is_rejected() -> TestResult {
 fn vault_marker_without_key_check_in_an_empty_database_is_completed() -> TestResult {
     // A crash after the marker was written but before the key check.
     let dir = TempDir::new()?;
-    fs::write(dir.path().join(MARKER_PATH), VAULT_MARKER)?;
+    fs::write(dir.path().join(MARKER_PATH), LEGACY_VAULT_MARKER)?;
     drop(open_vault(dir.path(), KEY_A)?);
     assert!(
         open_vault(dir.path(), KEY_B).is_err(),

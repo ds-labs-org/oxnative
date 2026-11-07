@@ -28,6 +28,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// File identifying an oxnative database directory.
 const MARKER_FILE: &str = "OXNATIVE";
 const MARKER_CONTENT: &str = "oxnative 1\nengine fjall 3\n";
+/// First marker line of vaulted databases. It differs from the plain one so
+/// that builds without vault support, which only compare the first line,
+/// refuse to open them. Vaulted databases created with the earlier
+/// `oxnative 1` + `vault 1` marker still open, so they need no migration.
+const MARKER_VAULT_FIRST_LINE: &str = "oxnative 2";
 /// Marker line added to databases whose vault column families are encrypted.
 const MARKER_VAULT_LINE: &str = "vault 1";
 /// Prefix of every marker line that describes the vault format.
@@ -702,14 +707,16 @@ fn check_marker(path: &Path, vault: bool) -> Result<(), KvError> {
             e.into()
         }
     })?;
-    if content.lines().next() != MARKER_CONTENT.lines().next() {
+    let first = content.lines().next();
+    let vault_first_line = first == Some(MARKER_VAULT_FIRST_LINE);
+    if first != MARKER_CONTENT.lines().next() && !vault_first_line {
         return Err(KvError::corruption(format!(
             "unsupported oxnative database format in {}: {:?}",
             path.display(),
             content.lines().next().unwrap_or_default()
         )));
     }
-    let mut marked_vault = false;
+    let mut marked_vault = vault_first_line;
     for line in content
         .lines()
         .filter(|l| l.starts_with(MARKER_VAULT_PREFIX))
@@ -739,9 +746,13 @@ fn check_marker(path: &Path, vault: bool) -> Result<(), KvError> {
 
 fn write_marker(path: &Path, vault: bool) -> Result<(), KvError> {
     let mut file = fs::File::create_new(path.join(MARKER_FILE))?;
-    file.write_all(MARKER_CONTENT.as_bytes())?;
     if vault {
+        let rest = MARKER_CONTENT.split_once('\n').map_or("", |(_, rest)| rest);
+        writeln!(file, "{MARKER_VAULT_FIRST_LINE}")?;
+        file.write_all(rest.as_bytes())?;
         writeln!(file, "{MARKER_VAULT_LINE}")?;
+    } else {
+        file.write_all(MARKER_CONTENT.as_bytes())?;
     }
     file.sync_all()?;
     Ok(())
