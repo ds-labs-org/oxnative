@@ -523,3 +523,98 @@ fn vault_marker_stays_after_reopen_and_still_rejected_by_old_check() -> TestResu
     assert!(!old_build_accepts_marker(dir.path())?);
     Ok(())
 }
+
+// --- first creation: atomicity and validation order (#13) ---
+
+/// Leaves only `vault_cfs` in the metadata, as a crash between the two
+/// first-creation inserts would.
+fn leave_only_vault_cfs(path: &Path) -> TestResult {
+    rewrite_meta(path, |meta, key, _| {
+        if key == b"vault_check" {
+            meta.remove(key)?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn meta_holding_only_vault_cfs_in_an_empty_database_is_completed() -> TestResult {
+    let dir = TempDir::new()?;
+    drop(open_vault(dir.path(), KEY_A)?);
+    leave_only_vault_cfs(dir.path())?;
+    let keys: Vec<_> = meta_entries(dir.path())?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    assert_eq!(keys, vec![b"vault_cfs".to_vec()], "the crash state");
+    drop(open_vault(dir.path(), KEY_A)?);
+    assert!(
+        open_vault(dir.path(), KEY_B).is_err(),
+        "the completed creation must be verified from now on"
+    );
+    drop(open_vault(dir.path(), KEY_A)?);
+    Ok(())
+}
+
+#[test]
+fn incomplete_creation_is_reset_to_the_requested_vault_cf_set() -> TestResult {
+    let dir = TempDir::new()?;
+    drop(open_vault_with_set(dir.path(), KEY_A, vec!["plain"])?);
+    leave_only_vault_cfs(dir.path())?;
+    drop(open_vault(dir.path(), KEY_B)?);
+    assert!(
+        open_vault_with_set(dir.path(), KEY_B, vec!["plain"]).is_err(),
+        "the stale unverified set must not survive"
+    );
+    drop(open_vault(dir.path(), KEY_B)?);
+    Ok(())
+}
+
+#[test]
+fn meta_holding_only_vault_cfs_with_data_fails_closed() -> TestResult {
+    let dir = TempDir::new()?;
+    create_vault_db(dir.path(), KEY_A)?;
+    leave_only_vault_cfs(dir.path())?;
+    assert!(open_vault(dir.path(), KEY_A).is_err());
+    assert!(open_vault(dir.path(), KEY_B).is_err());
+    Ok(())
+}
+
+#[test]
+fn read_only_open_of_an_incomplete_creation_does_not_open_unverified() -> TestResult {
+    let dir = TempDir::new()?;
+    drop(open_vault(dir.path(), KEY_A)?);
+    leave_only_vault_cfs(dir.path())?;
+    let read_only = Db::open_read_only_with_vault(dir.path(), definitions(), vault_options(KEY_B));
+    assert!(read_only.is_err(), "read-only must never complete creation");
+    Ok(())
+}
+
+#[test]
+fn unknown_vault_cf_on_first_open_fails_without_side_effects() -> TestResult {
+    let dir = TempDir::new()?;
+    let typo = open_vault_with_set(dir.path(), KEY_A, vec!["secrt"]);
+    assert!(typo.is_err(), "a name that is not a column family");
+    assert!(
+        !dir.path().join(MARKER_PATH).exists(),
+        "no marker may be written before the names are validated"
+    );
+    drop(open_vault(dir.path(), KEY_A)?);
+    assert!(open_vault(dir.path(), KEY_B).is_err());
+    Ok(())
+}
+
+#[test]
+fn unknown_vault_cf_leaves_no_key_check_behind() -> TestResult {
+    let dir = TempDir::new()?;
+    assert!(open_vault_with_set(dir.path(), KEY_A, vec!["secrt"]).is_err());
+    let has_fjall = dir.path().join("fjall").exists();
+    assert!(
+        !has_fjall || meta_entries(dir.path())?.is_empty(),
+        "no vault metadata may be written for invalid names"
+    );
+    // A correct open with another key and set is a clean first creation.
+    drop(open_vault_with_set(dir.path(), KEY_B, vec!["plain"])?);
+    assert!(open_vault_with_set(dir.path(), KEY_B, vec!["secret"]).is_err());
+    Ok(())
+}
