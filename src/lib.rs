@@ -229,6 +229,14 @@ impl Db {
         self.inner.writable
     }
 
+    /// Whether `column_family` is a sealed (vault) column family of this
+    /// database.
+    #[must_use]
+    pub const fn is_sealed(&self, column_family: &ColumnFamily) -> bool {
+        let _ = column_family;
+        false
+    }
+
     /// Returns the handle of a column family given at open time.
     pub fn column_family(&self, name: &'static str) -> Result<ColumnFamily, KvError> {
         self.inner
@@ -941,6 +949,14 @@ pub struct ColumnFamily {
 }
 
 impl ColumnFamily {
+    /// Whether the values of this column family are sealed (vault column
+    /// family). Always `false` without the `vault` feature.
+    #[must_use]
+    pub const fn is_sealed(&self) -> bool {
+        // Red-step scaffolding: real implementation follows the tests
+        false
+    }
+
     /// Name to look for in bulk-load files: files of a vault column family are
     /// sealed for it.
     #[cfg(feature = "vault")]

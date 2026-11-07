@@ -233,6 +233,8 @@ pub(crate) fn open(
 #[cfg(test)]
 mod backup_sst_tests;
 #[cfg(test)]
+mod fork_p0_tests;
+#[cfg(test)]
 mod open_tests;
 #[cfg(test)]
 mod rw_tests;
