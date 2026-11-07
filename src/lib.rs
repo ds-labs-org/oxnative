@@ -128,6 +128,7 @@ impl Db {
         db_options: DbOptions,
     ) -> Result<Self, KvError> {
         let vault = db_options_vault(&db_options);
+        check_vault_column_families(&column_families, vault)?;
         let created = prepare_root(path, vault.is_some())?;
         let mut builder = fjall::Database::builder(path.join(FJALL_DIR));
         if let Some(max_open_files) = db_options
@@ -138,7 +139,7 @@ impl Db {
             builder = builder.max_cached_files(Some(max_open_files));
         }
         let db = builder.open()?;
-        verify_vault_state(&db, vault, created)?;
+        verify_vault_state(&db, vault, created, true)?;
         let inner = DbInner::new(db, &column_families, vault, path, true, None)?;
         inner.recover_bulk_load()?;
         Ok(Self {
@@ -193,7 +194,7 @@ impl Db {
         }
         let copy = PrivateCopy::create(&source, path)?;
         let db = fjall::Database::builder(copy.path()).open()?;
-        verify_vault_state(&db, vault, false)?;
+        verify_vault_state(&db, vault, false, false)?;
         let inner = DbInner::new(db, column_families, vault, path, false, Some(copy))?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -404,10 +405,6 @@ impl Db {
 }
 
 impl DbInner {
-    #[cfg_attr(
-        not(feature = "vault"),
-        expect(unused_variables, reason = "only vaulted databases need it")
-    )]
     fn new(
         db: fjall::Database,
         definitions: &[ColumnFamilyDefinition],
@@ -423,17 +420,7 @@ impl DbInner {
         }
         #[cfg(feature = "vault")]
         let vault_key = vault.map(|v| Arc::new(v.key.clone()));
-        #[cfg(feature = "vault")]
-        if let Some(vault) = vault
-            && let Some(unknown) = vault
-                .vault_column_families
-                .iter()
-                .find(|name| !names.contains(name))
-        {
-            return Err(KvError::other(format!(
-                "vault column family {unknown:?} is not a column family of the database"
-            )));
-        }
+        check_vault_column_families(definitions, vault)?;
         let mut column_families = Vec::with_capacity(names.len());
         for (index, name) in names.into_iter().enumerate() {
             if name.is_empty() || name.len() > usize::from(u8::MAX) || name == META_KEYSPACE {
@@ -778,6 +765,7 @@ fn verify_vault_state(
     db: &fjall::Database,
     vault: Option<&VaultOptions>,
     created: bool,
+    writable: bool,
 ) -> Result<(), KvError> {
     let meta = db.keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)?;
     let stored = meta.get(VAULT_CHECK_KEY)?;
@@ -808,9 +796,17 @@ fn verify_vault_state(
                     ))
                 }
             }
-            None if created || is_empty_database(db)? => {
-                meta.insert(VAULT_CFS_KEY, wanted.as_slice())?;
-                meta.insert(VAULT_CHECK_KEY, vault::new_check(&vault.key, &wanted)?)?;
+            // First creation, possibly interrupted: complete or reset it. Both
+            // keys go in one batch, so a crash leaves all or none of them.
+            None if writable && (created || is_empty_database(db, &meta)?) => {
+                let mut batch = db.batch();
+                batch.insert(&meta, VAULT_CFS_KEY, wanted.as_slice());
+                batch.insert(
+                    &meta,
+                    VAULT_CHECK_KEY,
+                    vault::new_check(&vault.key, &wanted)?,
+                );
+                batch.commit()?;
                 Ok(db.persist(PersistMode::SyncAll)?)
             }
             None => Err(KvError::corruption("the vault key check is missing")),
@@ -822,17 +818,54 @@ fn verify_vault_state(
     }
 }
 
-/// Whether no keyspace holds any data. A vaulted database whose creation was
-/// interrupted before its key check was written looks like this.
+/// Whether the database holds no data. A vaulted database whose creation was
+/// interrupted looks like this: its metadata is empty or holds only the
+/// unverified `vault_cfs` record.
 #[cfg(feature = "vault")]
-fn is_empty_database(db: &fjall::Database) -> Result<bool, KvError> {
+fn is_empty_database(db: &fjall::Database, meta: &fjall::Keyspace) -> Result<bool, KvError> {
+    let meta_is_unfinished =
+        meta.is_empty()? || (meta.get(VAULT_CFS_KEY)?.is_some() && meta.len()? == 1);
+    if !meta_is_unfinished {
+        return Ok(false);
+    }
     for name in db.list_keyspace_names() {
+        if name.as_ref() == META_KEYSPACE {
+            continue;
+        }
         let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
         if !keyspace.is_empty()? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Fails if a vault column family is not one of the database's column
+/// families. Runs before anything is written.
+#[cfg(feature = "vault")]
+fn check_vault_column_families(
+    definitions: &[ColumnFamilyDefinition],
+    vault: Option<&VaultOptions>,
+) -> Result<(), KvError> {
+    if let Some(vault) = vault
+        && let Some(unknown) = vault.vault_column_families.iter().find(|name| {
+            **name != DEFAULT_COLUMN_FAMILY && !definitions.iter().any(|d| d.name == **name)
+        })
+    {
+        return Err(KvError::other(format!(
+            "vault column family {unknown:?} is not a column family of the database"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vault"))]
+#[expect(clippy::unnecessary_wraps, reason = "same signature as with `vault`")]
+fn check_vault_column_families(
+    _definitions: &[ColumnFamilyDefinition],
+    _vault: Option<&VaultOptions>,
+) -> Result<(), KvError> {
+    Ok(())
 }
 
 fn unique_suffix() -> String {
