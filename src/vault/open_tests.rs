@@ -618,3 +618,39 @@ fn unknown_vault_cf_leaves_no_key_check_behind() -> TestResult {
     assert!(open_vault_with_set(dir.path(), KEY_B, vec!["secret"]).is_err());
     Ok(())
 }
+
+// --- additive entry point (#14) ---
+
+#[test]
+fn open_read_write_with_vault_creates_and_reopens_a_vaulted_db() -> TestResult {
+    let dir = TempDir::new()?;
+    {
+        let db = Db::open_read_write_with_vault(
+            dir.path(),
+            definitions(),
+            DbOptions::default(),
+            vault_options(KEY_A),
+        )?;
+        let secret = db.column_family("secret")?;
+        db.insert(&secret, b"k", b"secret value")?;
+        db.flush()?;
+    }
+    let db = Db::open_read_only_with_vault(dir.path(), definitions(), vault_options(KEY_A))?;
+    let secret = db.column_family("secret")?;
+    assert_eq!(
+        db.get(&secret, b"k")?.as_deref(),
+        Some(&b"secret value"[..])
+    );
+    assert!(
+        Db::open_read_write_with_vault(
+            dir.path(),
+            definitions(),
+            DbOptions::default(),
+            vault_options(KEY_B)
+        )
+        .is_err(),
+        "a wrong key must fail closed"
+    );
+    assert!(open_plain(dir.path()).is_err(), "no key on a vaulted db");
+    Ok(())
+}

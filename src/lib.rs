@@ -179,6 +179,19 @@ impl Db {
         Self::open_read_only_inner(path, &column_families, Some(&vault))
     }
 
+    /// Opens or creates a vaulted database at `path` in read-write mode.
+    #[cfg(feature = "vault")]
+    pub fn open_read_write_with_vault(
+        _path: &Path,
+        _column_families: Vec<ColumnFamilyDefinition>,
+        _db_options: DbOptions,
+        _vault: VaultOptions,
+    ) -> Result<Self, KvError> {
+        Err(KvError::other(
+            "open_read_write_with_vault is not implemented",
+        ))
+    }
+
     fn open_read_only_inner(
         path: &Path,
         column_families: &[ColumnFamilyDefinition],
