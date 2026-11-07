@@ -297,7 +297,14 @@ fn stripping_the_vault_flag_from_the_marker_does_not_downgrade() -> TestResult {
 #[test]
 fn adding_the_vault_flag_to_a_plain_marker_is_refused() -> TestResult {
     let dir = TempDir::new()?;
-    drop(open_plain(dir.path())?);
+    {
+        // An empty database is indistinguishable from an interrupted creation.
+        let db = open_plain(dir.path())?;
+        let plain = db.column_family("plain")?;
+        let mut transaction = db.start_transaction()?;
+        transaction.insert(&plain, b"k", b"plain value");
+        transaction.commit()?;
+    }
     fs::write(dir.path().join(MARKER_PATH), VAULT_MARKER)?;
     assert!(
         open_vault(dir.path(), KEY_A).is_err(),
@@ -360,5 +367,31 @@ fn key_check_copied_from_another_database_is_rejected() -> TestResult {
         open_vault(victim.path(), KEY_A).is_err(),
         "a check sealed under another key must not validate"
     );
+    Ok(())
+}
+
+#[test]
+fn vault_marker_without_key_check_in_an_empty_database_is_completed() -> TestResult {
+    // A crash after the marker was written but before the key check.
+    let dir = TempDir::new()?;
+    fs::write(dir.path().join(MARKER_PATH), VAULT_MARKER)?;
+    drop(open_vault(dir.path(), KEY_A)?);
+    assert!(
+        open_vault(dir.path(), KEY_B).is_err(),
+        "the check was written"
+    );
+    drop(open_vault(dir.path(), KEY_A)?);
+    Ok(())
+}
+
+#[test]
+fn missing_key_check_with_data_still_fails_closed() -> TestResult {
+    let dir = TempDir::new()?;
+    create_vault_db(dir.path(), KEY_A)?;
+    rewrite_meta(dir.path(), |meta, key, _| {
+        meta.remove(key)?;
+        Ok(())
+    })?;
+    assert!(open_vault(dir.path(), KEY_B).is_err());
     Ok(())
 }

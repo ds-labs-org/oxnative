@@ -673,7 +673,7 @@ fn verify_vault_state(
     {
         match stored {
             Some(stored) => vault::verify_check(&vault.key, &stored),
-            None if created => {
+            None if created || is_empty_database(db)? => {
                 meta.insert(VAULT_CHECK_KEY, vault::new_check(&vault.key)?)?;
                 Ok(db.persist(PersistMode::SyncAll)?)
             }
@@ -684,6 +684,19 @@ fn verify_vault_state(
     {
         match *vault {}
     }
+}
+
+/// Whether no keyspace holds any data. A vaulted database whose creation was
+/// interrupted before its key check was written looks like this.
+#[cfg(feature = "vault")]
+fn is_empty_database(db: &fjall::Database) -> Result<bool, KvError> {
+    for name in db.list_keyspace_names() {
+        let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
+        if !keyspace.is_empty()? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn unique_suffix() -> String {
