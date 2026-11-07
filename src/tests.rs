@@ -376,3 +376,65 @@ fn large_overlapping_bulk_load() -> TestResult {
     assert!(snapshot.contains_key(&cf, b"existing")?);
     Ok(())
 }
+
+#[cfg(not(feature = "vault"))]
+#[test]
+fn db_options_stay_copy_without_the_vault_feature() {
+    fn assert_copy<T: Copy>() {}
+    assert_copy::<DbOptions>();
+}
+
+// --- vault marker, behaviour of builds without vault support (#5) ---
+
+const PLAIN_MARKER: &str = "oxnative 1\nengine fjall 3\n";
+const VAULT_MARKER: &str = "oxnative 1\nengine fjall 3\nvault 1\n";
+
+#[test]
+fn plain_marker_is_byte_identical_to_the_previous_format() -> TestResult {
+    let dir = TempDir::new()?;
+    drop(open(dir.path())?);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("OXNATIVE"))?,
+        PLAIN_MARKER,
+        "a plain database must keep writing the historical marker"
+    );
+    Ok(())
+}
+
+#[test]
+fn plain_open_refuses_a_marker_with_the_vault_flag() -> TestResult {
+    let dir = TempDir::new()?;
+    {
+        let db = open(dir.path())?;
+        let cf = db.column_family("a")?;
+        commit_keys(&db, &cf, &["k"])?;
+    }
+    fs::write(dir.path().join("OXNATIVE"), VAULT_MARKER)?;
+    assert!(
+        open(dir.path()).is_err(),
+        "a build or caller without vault support must not open a vaulted database"
+    );
+    assert!(
+        Db::open_read_only(dir.path(), definitions()).is_err(),
+        "read-only open must refuse a vaulted database too"
+    );
+    Ok(())
+}
+
+#[test]
+fn plain_database_still_opens_after_a_refused_vault_open() -> TestResult {
+    let dir = TempDir::new()?;
+    {
+        let db = open(dir.path())?;
+        let cf = db.column_family("a")?;
+        commit_keys(&db, &cf, &["k"])?;
+    }
+    let db = open(dir.path())?;
+    let cf = db.column_family("a")?;
+    assert!(db.contains_key(&cf, b"k")?);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("OXNATIVE"))?,
+        PLAIN_MARKER
+    );
+    Ok(())
+}
