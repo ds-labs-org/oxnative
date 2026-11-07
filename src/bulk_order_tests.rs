@@ -259,3 +259,83 @@ fn recovery_of_a_plain_bulk_load_with_a_bad_file_does_not_panic() -> TestResult 
 fn recovery_of_a_sealed_bulk_load_with_a_bad_file_does_not_panic() -> TestResult {
     assert_recovery_does_not_panic(&TempDir::new()?, &open_vault, true)
 }
+
+/// Writes a recorded load as left by a crash, then lets `damage` change the
+/// file, and returns the path.
+fn crash_with_recorded_load(
+    dir: &TempDir,
+    open: &dyn Fn(&Path) -> Result<Db, KvError>,
+    damage: &dyn Fn(&Path) -> TestResult,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let db = open(dir.path())?;
+    let cf = db.column_family(CF)?;
+    let mut file = db.new_sst_file_for(&cf)?;
+    for (key, value) in VALUES {
+        file.insert(key, value)?;
+    }
+    let path = file.finish()?;
+    let files = [(&cf, vec![path.clone()])];
+    db.inner.write_bulk_load_record(files.iter())?;
+    damage(&path)?;
+    Ok(path)
+}
+
+/// A recorded file that is gone or unusable must not make the database
+/// unopenable: the unacknowledged load is abandoned and the record cleared.
+fn assert_unusable_file_is_discarded(
+    open: &dyn Fn(&Path) -> Result<Db, KvError>,
+    damage: &dyn Fn(&Path) -> TestResult,
+) -> TestResult {
+    let dir = TempDir::new()?;
+    crash_with_recorded_load(&dir, open, damage)?;
+    let db = open(dir.path())?;
+    assert_eq!(stored_record(&db)?, None, "the record must be cleared");
+    let cf = db.column_family(CF)?;
+    for (key, _) in VALUES {
+        assert!(db.get(&cf, key)?.is_none(), "nothing may be loaded");
+    }
+    drop((db, cf));
+    open(dir.path())?;
+    Ok(())
+}
+
+fn disorder(sealed: bool) -> impl Fn(&Path) -> TestResult {
+    move |path| permute(path, sealed, &[1, 0, 2])
+}
+
+fn remove(path: &Path) -> TestResult {
+    Ok(fs::remove_file(path)?)
+}
+
+fn truncate(path: &Path) -> TestResult {
+    let bytes = fs::read(path)?;
+    fs::write(path, bytes.get(..bytes.len() - 3).ok_or("short file")?)?;
+    Ok(())
+}
+
+#[test]
+fn recovery_discards_a_recorded_disordered_file() -> TestResult {
+    assert_unusable_file_is_discarded(&open_plain, &disorder(false))
+}
+
+#[test]
+fn recovery_discards_a_recorded_missing_file() -> TestResult {
+    assert_unusable_file_is_discarded(&open_plain, &remove)
+}
+
+#[test]
+fn recovery_discards_a_recorded_truncated_file() -> TestResult {
+    assert_unusable_file_is_discarded(&open_plain, &truncate)
+}
+
+#[cfg(feature = "vault")]
+#[test]
+fn recovery_discards_a_recorded_disordered_sealed_file() -> TestResult {
+    assert_unusable_file_is_discarded(&open_vault, &disorder(true))
+}
+
+#[cfg(feature = "vault")]
+#[test]
+fn recovery_discards_a_recorded_missing_sealed_file() -> TestResult {
+    assert_unusable_file_is_discarded(&open_vault, &remove)
+}

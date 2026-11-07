@@ -601,9 +601,12 @@ impl DbInner {
 
     /// Completes a bulk load interrupted by a crash.
     ///
-    /// The files are verified before any ingestion; a bad file (disordered,
-    /// tampered, unopenable) makes the open fail with an error, never a panic,
-    /// and leaves the record in place so that nothing is silently discarded.
+    /// The files are verified before any ingestion, never panicking. A load
+    /// was never acknowledged to its caller before its record was cleared, so
+    /// when a file is missing, truncated, disordered or tampered the load is
+    /// abandoned: nothing is ingested, the record is cleared and the database
+    /// opens. Any other failure (e.g. a transient I/O error) fails the open and
+    /// keeps the record for the next attempt.
     fn recover_bulk_load(&self) -> Result<(), KvError> {
         let Some(record) = self.meta.get(BULK_LOAD_KEY)? else {
             return Ok(());
@@ -625,18 +628,24 @@ impl DbInner {
         // Re-ingesting a column family that was already ingested is harmless:
         // the files hold the same keys and values.
         for (cf, paths) in by_cf.values() {
-            cf.verify_bulk_files(paths)?;
+            match cf.verify_bulk_files(paths) {
+                Ok(()) => {}
+                Err(error) if is_unusable_file(&error) => {
+                    self.clear_bulk_load_record()?;
+                    for (_, paths) in by_cf.values() {
+                        remove_leftover_files(paths);
+                    }
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
         }
         for (cf, paths) in by_cf.values() {
             sst::ingest(&cf.keyspace, paths, cf.sealed_name())?;
         }
         self.clear_bulk_load_record()?;
         for (_, paths) in by_cf.values() {
-            for path in paths {
-                // The loader that created them is gone
-                #[expect(unused_must_use, reason = "a leftover file only wastes space")]
-                fs::remove_file(path);
-            }
+            remove_leftover_files(paths);
         }
         Ok(())
     }
@@ -755,6 +764,27 @@ fn check_marker(path: &Path, vault: bool) -> Result<(), KvError> {
             path.display()
         ))),
         _ => Ok(()),
+    }
+}
+
+/// Whether the error says that a bulk-load file itself is missing, cut or
+/// invalid, as opposed to a failure that may go away on retry.
+fn is_unusable_file(error: &KvError) -> bool {
+    match error {
+        KvError::Corruption(_) => true,
+        KvError::Io(e) => matches!(
+            e.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
+/// Removes files of a bulk load whose loader is gone.
+fn remove_leftover_files(paths: &[PathBuf]) {
+    for path in paths {
+        #[expect(unused_must_use, reason = "a leftover file only wastes space")]
+        fs::remove_file(path);
     }
 }
 
