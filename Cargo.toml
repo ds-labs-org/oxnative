@@ -15,8 +15,15 @@ publish = false
 [dev-dependencies]
 tempfile = "3.1"
 
+[features]
+default = []
+# Encrypted-at-rest ("vaulted") column families, see the README.
+vault = ["dep:chacha20poly1305", "dep:zeroize"]
+
 [dependencies]
 fjall = "3.1.13"
+chacha20poly1305 = { version = "0.10.1", optional = true, features = ["std", "getrandom"] }
+zeroize = { version = "1.8", optional = true }
 
 # Same lints as the Oxigraph workspace (copied from its Cargo.toml) so the code
 # can move between the two without style churn.

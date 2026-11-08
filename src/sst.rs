@@ -3,6 +3,10 @@
 //! The format is private to this crate: a magic header, then records of
 //! `[u32 LE key length][key][u32 LE value length][value]` in strictly
 //! increasing key order.
+//!
+//! A file sealed for a vault column family starts with another magic, then
+//! `[u32 LE length][column family name]`, and holds sealed values. Plain
+//! files and plain column families never meet sealed ones.
 
 use crate::error::KvError;
 use std::cmp::Reverse;
@@ -12,11 +16,21 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"OXNSST1\n";
+const SEALED_MAGIC: &[u8; 8] = b"OXNSST2\n";
+
+/// Opens a sealed value given its key.
+pub type OpenFn<'a> = dyn Fn(&[u8], &[u8]) -> Result<Vec<u8>, KvError> + 'a;
+
+#[cfg(feature = "vault")]
+/// Seals a value given its key.
+pub type SealFn = Box<dyn Fn(&[u8], &[u8]) -> Result<Vec<u8>, KvError> + Send + Sync>;
 
 pub struct Writer {
     file: BufWriter<File>,
     path: PathBuf,
     last_key: Option<Vec<u8>>,
+    #[cfg(feature = "vault")]
+    seal: Option<SealFn>,
 }
 
 impl Writer {
@@ -28,6 +42,26 @@ impl Writer {
             file,
             path,
             last_key: None,
+            #[cfg(feature = "vault")]
+            seal: None,
+        })
+    }
+
+    #[cfg(feature = "vault")]
+    /// Creates a file whose values are sealed by `seal`, for `column_family`.
+    pub fn create_sealed(
+        path: PathBuf,
+        column_family: &str,
+        seal: SealFn,
+    ) -> Result<Self, KvError> {
+        let mut file = BufWriter::new(File::create_new(&path)?);
+        file.write_all(SEALED_MAGIC)?;
+        write_chunk(&mut file, column_family.as_bytes())?;
+        Ok(Self {
+            file,
+            path,
+            last_key: None,
+            seal: Some(seal),
         })
     }
 
@@ -38,6 +72,12 @@ impl Writer {
             ));
         }
         write_chunk(&mut self.file, key)?;
+        #[cfg(feature = "vault")]
+        if let Some(seal) = &self.seal {
+            write_chunk(&mut self.file, &seal(key, value)?)?;
+            self.last_key = Some(key.to_vec());
+            return Ok(());
+        }
         write_chunk(&mut self.file, value)?;
         self.last_key = Some(key.to_vec());
         Ok(())
@@ -62,20 +102,47 @@ fn write_chunk(file: &mut impl Write, chunk: &[u8]) -> io::Result<()> {
 
 struct Reader {
     file: BufReader<File>,
+    last_key: Option<Vec<u8>>,
 }
 
 impl Reader {
-    fn open(path: &Path) -> Result<Self, KvError> {
+    /// Opens a file that must be plain (`sealed_for` is `None`) or sealed for
+    /// the given column family.
+    fn open(path: &Path, sealed_for: Option<&str>) -> Result<Self, KvError> {
         let mut file = BufReader::new(File::open(path)?);
         let mut magic = [0; MAGIC.len()];
         file.read_exact(&mut magic)?;
-        if &magic != MAGIC {
-            return Err(KvError::corruption(format!(
-                "{} is not an oxnative bulk-load file",
-                path.display()
-            )));
+        let mut reader = Self {
+            file,
+            last_key: None,
+        };
+        match (&magic, sealed_for) {
+            (m, None) if m == MAGIC => {}
+            (m, Some(column_family)) if m == SEALED_MAGIC => {
+                let mut len = [0; 4];
+                reader.file.read_exact(&mut len)?;
+                let name = reader.read_chunk(len)?;
+                if name != column_family.as_bytes() {
+                    return Err(KvError::other(format!(
+                        "{} is sealed for another column family than {column_family:?}",
+                        path.display()
+                    )));
+                }
+            }
+            (m, _) if m == MAGIC || m == SEALED_MAGIC => {
+                return Err(KvError::other(format!(
+                    "{} does not match the kind of the column family (sealed or plain)",
+                    path.display()
+                )));
+            }
+            _ => {
+                return Err(KvError::corruption(format!(
+                    "{} is not an oxnative bulk-load file",
+                    path.display()
+                )));
+            }
         }
-        Ok(Self { file })
+        Ok(reader)
     }
 
     fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>, KvError> {
@@ -89,6 +156,18 @@ impl Reader {
         let key = self.read_chunk(len)?;
         self.file.read_exact(&mut len)?;
         let value = self.read_chunk(len)?;
+        // Ingestion requires strictly increasing keys: a tampered file must be
+        // refused here rather than make it panic
+        if self
+            .last_key
+            .as_deref()
+            .is_some_and(|last| last >= key.as_slice())
+        {
+            return Err(KvError::corruption(
+                "keys of a bulk-load file are not in strictly increasing order",
+            ));
+        }
+        self.last_key = Some(key.clone());
         Ok(Some((key, value)))
     }
 
@@ -101,16 +180,40 @@ impl Reader {
     }
 }
 
+/// Checks the files before any ingestion: that they are of the right kind
+/// that their keys are strictly increasing and, for a vault column family
+/// (`sealed` holds its name and the function opening a value), that every
+/// sealed value opens.
+pub fn verify(paths: &[PathBuf], sealed: Option<(&str, &OpenFn<'_>)>) -> Result<(), KvError> {
+    for path in paths {
+        let mut reader = Reader::open(path, sealed.map(|(name, _)| name))?;
+        // Reads every record: checks key order for all files, and that every
+        // sealed value opens for sealed ones
+        while let Some((key, value)) = reader.next()? {
+            if let Some((_, open)) = sealed {
+                open(&key, &value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Ingests the union of the given files into `keyspace`.
 ///
 /// Files are individually sorted but may overlap: they are merged and, for keys
 /// present in several files, the value of the last file wins. Ingested data
 /// gets a newer sequence number than everything already in the keyspace, so it
 /// overrides existing values and removals.
-pub fn ingest(keyspace: &fjall::Keyspace, paths: &[PathBuf]) -> Result<(), KvError> {
+///
+/// The files must be plain, or sealed for `sealed_for`.
+pub fn ingest(
+    keyspace: &fjall::Keyspace,
+    paths: &[PathBuf],
+    sealed_for: Option<&str>,
+) -> Result<(), KvError> {
     let mut readers = paths
         .iter()
-        .map(|p| Reader::open(p))
+        .map(|p| Reader::open(p, sealed_for))
         .collect::<Result<Vec<_>, _>>()?;
     // Min-heap on (key, reversed file index): for equal keys the last file pops
     // first, and the later duplicates are skipped. The current value of each

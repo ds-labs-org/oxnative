@@ -92,6 +92,167 @@ How each part of the contract maps onto fjall:
 - **`backup`** writes a new database from a snapshot. It is consistent even
   while background compaction runs.
 
+## Vaulted column families (feature `vault`)
+
+Optional encryption at rest for chosen column families. It is behind the Cargo
+feature `vault`, which is off by default: without it the crate has no extra
+dependency and behaves exactly as before.
+
+```sh
+cargo build --features vault
+cargo test --features vault
+```
+
+### Threat model
+
+Protected: an attacker who obtains the database directory, a `backup()` of it
+or a bulk-load file (disk theft, stolen backup, shared snapshot) without the
+key cannot read the **values** of the vault column families, and cannot forge
+or alter a value, or move one to another key or column family, without
+detection. Authenticity is per value only (see "Integrity" below).
+
+Not protected:
+
+- **Keys are plaintext**, in every column family. They must stay plaintext so
+  that ordering, range scans and prefix scans keep working. Do not vault a
+  column family whose keys are themselves secret; the number of records, the
+  key lengths and the sizes of the values (plaintext length plus 42 bytes) are
+  visible too.
+- Plain column families and the `_oxnative_meta` keyspace are not encrypted.
+- A running process: the key and the decrypted values are in its memory, and
+  anyone who can read it or call the API has the data. Every `VaultKey` is
+  zeroized when dropped, which is best effort.
+- Integrity is limited to the pair (column family name, record key). The
+  associated data does not contain a version, a database identifier or any
+  other context, so:
+  - a value can be **replayed**: an older sealed value copied back under its
+    own key and column family opens without error, and returns stale data;
+  - sealed bytes can be transplanted between databases that share a key: a
+    sealed value copied from one database into the same column family and key
+    of another database with the same key is accepted;
+  - restoring an older copy of the whole directory is valid, for the same
+    reason.
+  Use a distinct key per database to rule out transplants.
+- Key management: this crate takes the 32 bytes and nothing else. Where the key
+  is stored, how it is derived and who may read it is the caller's business.
+
+### What it does
+
+- Cipher: XChaCha20-Poly1305 (RustCrypto), with a random 24-byte nonce per
+  value.
+- Only values are encrypted. The associated data is the column family name and
+  the record key, so a sealed value copied under another key or into another
+  column family fails to open. It does not bind a version or a database, see
+  the threat model.
+- Fail closed: a missing key, a wrong key (checked at open with a sealed key
+  check stored in `_oxnative_meta`), a damaged value or a vault column family
+  name that is not among the column families all return an error. Nothing is
+  ever returned as garbage or as plaintext fallback.
+- Plain and vault column families coexist in one database.
+- A database is vaulted or plain for its whole life, decided at creation. A
+  plain database is never converted, and a vaulted one cannot be opened
+  without its key (nor by a build without the feature).
+- `Db::backup` copies vault values as stored, still sealed, and the backup
+  opens with the same key, through `Db::open_read_write_with_vault` or
+  `Db::open_read_only_with_vault` (the plain `open_*` functions refuse it). `Db::new_sst_file_for` seals the values of a bulk
+  file of a vault column family; such a file only loads into that column
+  family of a database with the same key.
+- No rotation yet: the sealed format reserves a key id, so it can be added
+  without a format change (backlog #9).
+
+### API
+
+```rust,ignore
+use oxnative::{ColumnFamilyDefinition, Db, DbOptions, VaultKey, VaultOptions};
+
+let key = VaultKey::new(key_bytes); // [u8; 32]; VaultKey::try_from(&[u8]) checks the length
+let db = Db::open_read_write_with_vault(
+    path,
+    column_families, // Vec<ColumnFamilyDefinition>, including "id2str"
+    DbOptions::default(),
+    VaultOptions {
+        key,
+        vault_column_families: vec!["id2str"],
+    },
+)?;
+// then use `get`, `insert`, transactions, `iter`, `scan_prefix`, `new_sst_file_for`
+// as usual: sealing and opening are transparent.
+
+// Read-only handles of a vaulted database need the key too:
+// Db::open_read_only_with_vault(path, column_families, vault_options)
+```
+
+`DbOptions` is identical with and without the feature (still `Copy`, no vault
+field): the feature is additive. `Db::open_read_only` on a vaulted database, and
+`Db::open_read_write` on one, fail.
+For bulk loads of a vault column family use `new_sst_file_for(&cf)`: a file
+from `new_sst_file()` would hold plaintext, so it fails on a database with vault
+column families (and `insert_stt_files` refuses such files for them).
+
+### On-disk format
+
+- `OXNATIVE` marker of a vaulted database, written by the current version:
+
+  ```text
+  oxnative 2
+  engine fjall 3
+  vault 1
+  ```
+
+  The first line differs from the `oxnative 1` of plain databases, so builds
+  without vault support, which only compare the first line, refuse to open it.
+  Vaulted databases created earlier with `oxnative 1` as first line (and a
+  `vault 1` line) still open; a `vault` line with another version is refused.
+  A plain database keeps the two-line marker `oxnative 1` / `engine fjall 3`.
+- Each stored value of a vault column family is
+  `format version (1 byte, 1) || key id (1 byte, 0) || nonce (24) || ciphertext || tag (16)`:
+  42 bytes of overhead. Values are not compressible after encryption, so the
+  LZ4 setting does not help on them.
+- Associated data: `format version || key id || len(column family) as u64 LE
+  || column family name || record key`.
+- `_oxnative_meta` holds `vault_check`, a sealed constant bound to its location,
+  which tells a wrong key from a right one without reading user data, and
+  `vault_cfs`, the sorted set of vault column families the check is bound to. An
+  open whose set differs is refused.
+- Bulk-load files of a vault column family carry sealed values and the column
+  family name.
+
+### Using it from the Oxigraph fork
+
+Vaulting **`id2str`** (the dictionary from the 128-bit hash to the string of
+every IRI, blank node and literal) alone protects much less than it seems:
+
+- The fork stores terms of at most 15 bytes inline in the encoded terms, hence
+  in the plaintext keys of the index column families, and never writes them to
+  `id2str`. Short IRIs, short strings, and all numeric, boolean, date, time and
+  duration literals are therefore in clear text in the index keys. Only terms
+  over 15 bytes reach `id2str`.
+- For those, the key of the other terms is a hash, `StrHash`, which is plain
+  unkeyed SipHash-2-4. Anyone with the database can hash a guessed value (a
+  known IRI, a name, an e-mail address) and look for the hash in the index
+  keys: equality of guessable values is confirmable, vaulted or not. Only long
+  values that cannot be guessed are really protected.
+- The structure of the graph (which hashes occur together, in which graphs)
+  stays visible.
+
+Real protection of term contents needs changes in the fork, not only vaulting:
+no inlining (every term goes through `id2str`), and a keyed hash for `StrHash`
+derived from the vault key instead of the unkeyed SipHash. Without them, treat
+the vault as protecting long, unguessable terms only.
+
+The nine index column families (`spog`, `posg`, `ospg`, `gspo`, `gpos`, `gosp`,
+`dspo`, `dpos`, `dosp`) keep the encoded terms in their keys and have empty
+values, so vaulting them protects nothing. Leave them, and `default`/`graphs`,
+plain unless the graph names themselves are secret (the `graphs` keys are the
+encoded graph names, also plaintext).
+
+In the fork, in `oxnative_wrapper.rs`, call `Db::open_read_write_with_vault` and
+`Db::open_read_only_with_vault` for read-only handles; `Store::open` and
+friends take the key from the caller, so the fork needs an opening function
+that accepts it. Its bulk loader must create the `id2str` files with
+`new_sst_file_for`. The fork's pure-Rust build turns the feature on with
+`oxnative = { ..., features = ["vault"] }`, and its CI runs with and without it.
+
 ## Known limitations
 
 - `open_read_only` costs a copy of the journals and of the metadata files, and
