@@ -229,6 +229,14 @@ impl Db {
         self.inner.writable
     }
 
+    /// Whether `column_family` is a sealed (vault) column family of this
+    /// database.
+    #[must_use]
+    #[expect(clippy::unused_self, reason = "the handle carries the sealing")]
+    pub const fn is_sealed(&self, column_family: &ColumnFamily) -> bool {
+        column_family.is_sealed()
+    }
+
     /// Returns the handle of a column family given at open time.
     pub fn column_family(&self, name: &'static str) -> Result<ColumnFamily, KvError> {
         self.inner
@@ -941,6 +949,24 @@ pub struct ColumnFamily {
 }
 
 impl ColumnFamily {
+    /// Whether the values of this column family are sealed (vault column
+    /// family). Always `false` without the `vault` feature.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "vault"),
+        expect(clippy::unused_self, reason = "same signature as with `vault`")
+    )]
+    pub const fn is_sealed(&self) -> bool {
+        #[cfg(feature = "vault")]
+        {
+            self.seal.is_some()
+        }
+        #[cfg(not(feature = "vault"))]
+        {
+            false
+        }
+    }
+
     /// Name to look for in bulk-load files: files of a vault column family are
     /// sealed for it.
     #[cfg(feature = "vault")]
